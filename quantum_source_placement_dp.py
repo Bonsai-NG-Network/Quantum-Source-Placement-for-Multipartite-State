@@ -425,6 +425,7 @@ class SourcePlacementDP:
 
 if __name__ == "__main__":
     from network_topology import Topology
+    from collections import Counter
 
     """
     3x3 grid example (length=10 on each edge):
@@ -462,3 +463,7 @@ if __name__ == "__main__":
         if y > 0:
             print(f"{e}: {y} pairs")
     print(f"\nTotal pairs used: {dbg['total_pairs']}, DP objective: {dbg['dp_value']:.4f}")
+
+    source_edge_list = [tuple(sorted(edge)) for edge in sources]
+    deployed_dict = dict(Counter(source_edge_list))
+    print(deployed_dict)

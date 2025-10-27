@@ -37,8 +37,21 @@ class EventSimulator:
         best_v = None
         best_dr = 0.0
 
+        def edge_cap(u, w):
+            return deployed_sources.get(tuple(sorted((u, w))), 0)
+
         for v in self.topo.graph.nodes():
-            if self.topo.graph.degree[v] < len(user_set):
+            # if self.topo.graph.degree[v] < len(user_set):
+            #     continue
+
+            required_flow = (len(user_set) - 1) if (v in user_set) else len(user_set)
+
+            # 统计与 v 相邻且已部署的总容量（允许同一条边容量>1）
+            incident_capacity = 0
+            for n in self.topo.graph.neighbors(v):
+                incident_capacity += edge_cap(v, n)
+
+            if incident_capacity < required_flow:
                 continue
 
             G_cap = nx.DiGraph()
@@ -63,7 +76,6 @@ class EventSimulator:
             except nx.NetworkXError:
                 continue
 
-            required_flow = len(user_set) - 1 if v in user_set else len(user_set)
             if flow_value < required_flow:
                 continue
 
@@ -248,13 +260,13 @@ class EventSimulator:
 
             num_ghz = 1  # Default for SP, MPG, MPC
 
-            if routing_method == 'SR':
+            if routing_method == 'PR':
                 time_to_success, num_ghz = self.run_single_trial_SP(user_set, self.p_op, edge_probs, deployed_dict)
             elif routing_method == 'MPG':
                 time_to_success = self.run_single_trial_MPG(user_set, self.p_op, edge_probs, deployed_dict)
             elif routing_method == 'MPC':
                 time_to_success = self.run_single_trial_MPC(user_set, self.p_op, deployed_dict)
-            elif routing_method == 'DR':
+            elif routing_method == 'RR':
                 time_to_success, num_ghz = self.run_single_trial_MPP(user_set, self.p_op, deployed_dict)
             else:
                 raise ValueError(f"Unknown routing_method: {routing_method}")

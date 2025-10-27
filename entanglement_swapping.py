@@ -87,22 +87,22 @@ class EntanglementSwapping:
             if not mem.memory_storage[peer_id]:
                 del mem.memory_storage[peer_id]
 
-
-if __name__ == "__main__":
-    # A - B - C
-    edge_list = [("A", "B", 10), ("B", "C", 15), ("C", "D", 10)]
-    net = QuantumNetwork(edge_list=edge_list, max_per_edge=2, decoherence_time=6)
-
-    net.attempt_entanglement("A", "B", gen_time=0, p_op=0.9)
-    net.attempt_entanglement("B", "C", gen_time=4, p_op=0.9)
-    net.attempt_entanglement("C", "D", gen_time=4, p_op=0.9)
-
-    print("\nBefore Swapping")
-    net.show_network_status(current_time=4)
-    swapping = EntanglementSwapping(net)
-    success = swapping.entanglement_swapping(path=["A", "B", "C", "D"], current_time=5, p_op=0.9)
-    if success:
-        print(f"\nAfter Successful Swapping")
-    else:
-        print(f"\nAfter Failed Swapping")
-    net.show_network_status(current_time=5)
+#
+# if __name__ == "__main__":
+#     # A - B - C
+#     edge_list = [("A", "B", 10), ("B", "C", 15), ("C", "D", 10)]
+#     net = QuantumNetwork(edge_list=edge_list, max_per_edge=2, decoherence_time=6)
+#
+#     net.attempt_entanglement("A", "B", gen_time=0, p_op=0.9)
+#     net.attempt_entanglement("B", "C", gen_time=4, p_op=0.9)
+#     net.attempt_entanglement("C", "D", gen_time=4, p_op=0.9)
+#
+#     print("\nBefore Swapping")
+#     net.show_network_status(current_time=4)
+#     swapping = EntanglementSwapping(net)
+#     success = swapping.entanglement_swapping(path=["A", "B", "C", "D"], current_time=5, p_op=0.9)
+#     if success:
+#         print(f"\nAfter Successful Swapping")
+#     else:
+#         print(f"\nAfter Failed Swapping")
+#     net.show_network_status(current_time=5)

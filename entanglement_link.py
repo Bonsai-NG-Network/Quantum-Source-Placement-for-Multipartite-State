@@ -55,6 +55,7 @@ class EntanglementLinkManager:
             link_id = f"n{edge_key[0]}-n{edge_key[1]}-t{gen_time}-{k}"
 
         else:
+            # fusion
             edge_key = tuple(sorted(nodes))
             link_id = f"GHZ_{'-'.join(map(str, edge_key))}-t{gen_time}"
 
@@ -67,6 +68,7 @@ class EntanglementLinkManager:
         else:
             r = random.random()
             success = (r < temp_link.p_e)
+            # in swappping and fusion, p_op=1, success=true
             if success:
                 self.links.append(temp_link)
             else:

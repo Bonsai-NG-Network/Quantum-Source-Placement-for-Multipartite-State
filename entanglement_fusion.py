@@ -101,21 +101,21 @@ class EntanglementFusion:
             if not mem.memory_storage[peer_id]:
                 del mem.memory_storage[peer_id]
 
-
-if __name__=="__main__":
-    # A —— D —— C
-    #      |    |
-    #      B ——
-    edge_list = [("A", "D", 10), ("D", "C", 15), ("D", "B", 10), ("B", "C", 20)]
-    net = QuantumNetwork(edge_list=edge_list, max_per_edge=2, decoherence_time=6)
-
-    net.attempt_entanglement("A", "D", p_op=0.9, gen_time=0)
-    net.attempt_entanglement("B", "D", p_op=0.9, gen_time=4)
-    net.attempt_entanglement("C", "D", p_op=0.9, gen_time=4)
-
-    print("\nBefore Fusion")
-    net.show_network_status(current_time=4)
-    fusion = EntanglementFusion(net)
-    fusion.fuse_users("D", ["A", "B", "C"], current_time=5, p_op=0.9)
-    print("\nAfter Fusion")
-    net.show_network_status(current_time=5)
+#
+# if __name__=="__main__":
+#     # A —— D —— C
+#     #      |    |
+#     #      B ——
+#     edge_list = [("A", "D", 10), ("D", "C", 15), ("D", "B", 10), ("B", "C", 20)]
+#     net = QuantumNetwork(edge_list=edge_list, max_per_edge=2, decoherence_time=6)
+#
+#     net.attempt_entanglement("A", "D", p_op=0.9, gen_time=0)
+#     net.attempt_entanglement("B", "D", p_op=0.9, gen_time=4)
+#     net.attempt_entanglement("C", "D", p_op=0.9, gen_time=4)
+#
+#     print("\nBefore Fusion")
+#     net.show_network_status(current_time=4)
+#     fusion = EntanglementFusion(net)
+#     fusion.fuse_users("D", ["A", "B", "C"], current_time=5, p_op=0.9)
+#     print("\nAfter Fusion")
+#     net.show_network_status(current_time=5)

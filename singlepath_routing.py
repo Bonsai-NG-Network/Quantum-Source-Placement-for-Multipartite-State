@@ -135,52 +135,52 @@ class SPEntanglementRouting:
         return time_slot, num_ghz_in_slot
 
 
-
-if __name__ == "__main__":
-    """
-       0 —— 1 —— 2
-       |    |    |
-       3 —— 4 —— 5
-       |    |    |
-       6 —— 7 —— 8
-    """
-    edge_list = [
-        (0, 1, 10),
-        (0, 3, 10),
-        (1, 2, 10),
-        (1, 4, 10),
-        (2, 5, 10),
-        (3, 4, 10),
-        (3, 6, 10),
-        (4, 5, 10),
-        (4, 7, 10),
-        (5, 8, 10),
-        (6, 7, 10),
-        (7, 8, 10)
-    ]
-    users = [0, 2, 7]
-    vc = 1
-    max_timeslot = 50
-    paths = {0: [1, 0],
-             2: [1, 2],
-             7: [1, 4, 7]}
-
-    # net = QuantumNetwork(edge_list=edge_list, memory_size=4, decoherence_time=6)
-    net = QuantumNetwork(length_network=3, width_network=3, edge_length_km=3, max_per_edge=4, decoherence_time=6)
-
-    source = SourcePlacement(net.topo)
-    sources = source.place_sources_for_request(users)
-    for u, v in sources:
-        net.attempt_entanglement(u, v, p_op=0.9, gen_time=0)
-
-    net.show_network_status(current_time=0)
-
-    SProuting = SPEntanglementRouting(net, users, p_op=0.9)
-    print("\n[SinglePath Routing Test]")
-    final_time, cost = SProuting.sp_routing(vc, paths, max_timeslot)
-    if final_time:
-        print(f"[SUCCESS] GHZ state generated at time slot {final_time}")
-    else:
-        print("[FAILURE] Protocol did not succeed within time limit")
-
-    net.show_network_status(current_time=final_time)
+#
+# if __name__ == "__main__":
+#     """
+#        0 —— 1 —— 2
+#        |    |    |
+#        3 —— 4 —— 5
+#        |    |    |
+#        6 —— 7 —— 8
+#     """
+#     edge_list = [
+#         (0, 1, 10),
+#         (0, 3, 10),
+#         (1, 2, 10),
+#         (1, 4, 10),
+#         (2, 5, 10),
+#         (3, 4, 10),
+#         (3, 6, 10),
+#         (4, 5, 10),
+#         (4, 7, 10),
+#         (5, 8, 10),
+#         (6, 7, 10),
+#         (7, 8, 10)
+#     ]
+#     users = [0, 2, 7]
+#     vc = 1
+#     max_timeslot = 50
+#     paths = {0: [1, 0],
+#              2: [1, 2],
+#              7: [1, 4, 7]}
+#
+#     net = QuantumNetwork(edge_list=edge_list, memory_size=4, decoherence_time=6)
+#     # net = QuantumNetwork(length_network=3, width_network=3, edge_length_km=3, max_per_edge=4, decoherence_time=6)
+#
+#     source = SourcePlacement(net.topo)
+#     sources = source.place_sources_for_request(users)
+#     for u, v in sources:
+#         net.attempt_entanglement(u, v, p_op=0.9, gen_time=0)
+#
+#     net.show_network_status(current_time=0)
+#
+#     SProuting = SPEntanglementRouting(net, users, p_op=0.9)
+#     print("\n[SinglePath Routing Test]")
+#     final_time, cost = SProuting.sp_routing(vc, paths, max_timeslot)
+#     if final_time:
+#         print(f"[SUCCESS] GHZ state generated at time slot {final_time}")
+#     else:
+#         print("[FAILURE] Protocol did not succeed within time limit")
+#
+#     net.show_network_status(current_time=final_time)

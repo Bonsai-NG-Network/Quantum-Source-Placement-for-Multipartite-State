@@ -74,24 +74,24 @@ class QuantumNode:
             channel.show_channel_info()
         print('\n')
 
-
-if __name__ == "__main__":
-    # A - B - C - D
-    edge_list = [
-        ("A", "B", 10),
-        ("B", "C", 15),
-        ("C", "D", 20)
-    ]
-    topo = Topology(edge_list)
-    topo.show_topology()
-
-    nodeB = QuantumNode(node_id="B", max_per_edge=1, decoherence_time=5)
-    for u, v in topo.get_edges():
-        if u == "B" or v == "B":
-            length_km = topo.get_edge_length(u, v)
-            nodeB.add_channel(u, v, length_km)
-
-    nodeB.node_record_entanglement("A", 0, 1)
-    nodeB.node_record_entanglement("C", 5, 1)
-    nodeB.show_node_status(3)
-    nodeB.show_node_status(9)
+#
+# if __name__ == "__main__":
+#     # A - B - C - D
+#     edge_list = [
+#         ("A", "B", 10),
+#         ("B", "C", 15),
+#         ("C", "D", 20)
+#     ]
+#     topo = Topology(edge_list)
+#     topo.show_topology()
+#
+#     nodeB = QuantumNode(node_id="B", max_per_edge=1, decoherence_time=5)
+#     for u, v in topo.get_edges():
+#         if u == "B" or v == "B":
+#             length_km = topo.get_edge_length(u, v)
+#             nodeB.add_channel(u, v, length_km)
+#
+#     nodeB.node_record_entanglement("A", 0, 1)
+#     nodeB.node_record_entanglement("C", 5, 1)
+#     nodeB.show_node_status(3)
+#     nodeB.show_node_status(9)

@@ -7,6 +7,9 @@ from event_simulator import EventSimulator
 from entanglement_distribution import EntanglementDistribution
 import numpy as np
 from network_request import RequestGenerator
+"""
+    柱状图+置信空间
+"""
 
 
 # --- Simulation Parameters ---
@@ -50,31 +53,6 @@ NUM_USERS_DT_5 = 3
 OP_DT_5 = 0.8
 DT_LIST_5 = [1, 2, 3, 4]
 
-#
-# EDGE_LIST = [
-#                 ("Setagaya", "Ota", 12.045),
-#                 ("Setagaya", "Shinagawa", 9.072),
-#                 ("Setagaya", "Minato", 9.945),
-#                 ("Setagaya", "Shinjuku", 7.916),
-#                 ("Setagaya", "Nerima", 10.885),
-#                 ("Ota", "Shinagawa", 6.464),
-#                 ("Shinagawa", "Minato", 6.788),
-#                 ("Minato", "Koto", 7.195),
-#                 ("Minato", "Chiyoda", 4.972),
-#                 ("Shinjuku", "Minato", 6.878),
-#                 ("Shinjuku", "Chiyoda", 5.461),
-#                 ("Shinjuku", "Itabashi", 7.446),
-#                 ("Shinjuku", "Nerima", 7.504),
-#                 ("Nerima", "Itabashi", 6.341),
-#                 ("Koto", "Edogawa", 6.868),
-#                 ("Chiyoda", "Koto", 7.248),
-#                 ("Chiyoda", "Edogawa", 11.528),
-#                 ("Chiyoda", "Bunkyo", 2.601),
-#                 ("Bunkyo", "Adachi", 9.701),
-#                 ("Itabashi", "Bunkyo", 7.239),
-#                 ("Edogawa", "Adachi", 10.682)
-#             ]
-
 
 EDGE_LIST = [
     (0, 1, 10), (1, 2, 10),
@@ -84,22 +62,6 @@ EDGE_LIST = [
     (0, 3, 10), (1, 4, 10), (2, 5, 10),
     (3, 6, 10), (4, 7, 10), (5, 8, 10),
 ]
-
-# EDGE_LIST = [
-#     (0, 1, 10), (1, 2, 10), (2, 3, 10), (3, 4, 10), (4, 5, 10),
-#     (6, 7, 10), (7, 8, 10), (8, 9, 10), (9, 10, 10), (10, 11, 10),
-#     (12, 13, 10), (13, 14, 10), (14, 15, 10), (15, 16, 10), (16, 17, 10),
-#     (18, 19, 10), (19, 20, 10), (20, 21, 10), (21, 22, 10), (22, 23, 10),
-#     (24, 25, 10), (25, 26, 10), (26, 27, 10), (27, 28, 10), (28, 29, 10),
-#     (30, 31, 10), (31, 32, 10), (32, 33, 10), (33, 34, 10), (34, 35, 10),
-#
-#     (0, 6, 10), (6, 12, 10), (12, 18, 10), (18, 24, 10), (24, 30, 10),
-#     (1, 7, 10), (7, 13, 10), (13, 19, 10), (19, 25, 10), (25, 31, 10),
-#     (2, 8, 10), (8, 14, 10), (14, 20, 10), (20, 26, 10), (26, 32, 10),
-#     (3, 9, 10), (9, 15, 10), (15, 21, 10), (21, 27, 10), (27, 33, 10),
-#     (4, 10, 10), (10, 16, 10), (16, 22, 10), (22, 28, 10), (28, 34, 10),
-#     (5, 11, 10), (11, 17, 10), (17, 23, 10), (23, 29, 10), (29, 35, 10),
-# ]
 
 
 def nodes_from_edge_list(edge_list):
@@ -115,8 +77,6 @@ def nodes_from_edge_list(edge_list):
 FIXED_BUDGET = 12
 COST_BUDGETS = list(range(12, 32, 4))
 
-# FIXED_BUDGET = 60
-# COST_BUDGETS = list(range(60, 82, 4))
 
 def export_run_parameters(writer):
     """Write key run parameters into a dedicated Excel sheet."""
@@ -164,6 +124,24 @@ def export_run_parameters(writer):
     df.to_excel(writer, sheet_name="Run_Params", index=False)
 
 
+def mean_and_ci95(samples):
+    """
+    Return (mean, half_CI95) for a list/array of samples.
+    Uses normal approx: mean ± 1.96 * std/sqrt(n).
+    """
+    import numpy as np
+    arr = np.asarray(samples, dtype=float)
+    n = len(arr)
+    if n == 0:
+        return 0.0, 0.0
+    mean = float(np.mean(arr))
+    if n == 1:
+        return mean, 0.0
+    std = float(np.std(arr, ddof=1))
+    half = 1.96 * std / (n ** 0.5)
+    return mean, half
+
+
 def run_and_get_metrics(params, user_sets_list):
     simulator = EventSimulator(
         # length_network=params['length_network'],
@@ -191,6 +169,16 @@ def run_and_get_metrics(params, user_sets_list):
 
     summary = dr_object.get_summary_dict()
     summary['deployed_dicts'] = str(deployed_dicts_per_trial)
+
+    dr_samples = summary.get('dr_list_trial', [])
+    dr_mean, dr_ci = mean_and_ci95(dr_samples)
+
+    # 检查均值是否与 summary['average_dr'] 一致（仅用于 sanity check）
+    if abs(dr_mean - summary.get('average_dr', dr_mean)) > 1e-9:
+        print(f"[WARN] average_dr mismatch: {summary['average_dr']:.6f} vs recomputed {dr_mean:.6f}")
+
+    summary['ci95_halfwidth'] = dr_ci
+
     return summary
 
 
@@ -217,7 +205,7 @@ def place_legend_inside(ax, loc='upper left', bbox_to_anchor=(0.02, 0.98)):
 
 
 # ---------- Generic plotting helpers ----------
-def create_dr_plot(title, x_label, figuresize=(11, 6)):
+def create_dr_plot(title, x_label, figuresize=(11, 6.5)):
     fig, ax = plt.subplots(figsize=figuresize)
     ax.set_xlabel(x_label, fontsize=28)
     ax.set_ylabel('Distribution Rate', fontsize=28)
@@ -228,7 +216,7 @@ def create_dr_plot(title, x_label, figuresize=(11, 6)):
 
 
 def create_combo_plot(title, x_label):
-    fig, ax1 = plt.subplots(figsize=(11, 6))
+    fig, ax1 = plt.subplots(figsize=(11, 6.5))
     ax2 = ax1.twinx()
     ax1.set_xlabel(x_label, fontsize=28)
     ax1.set_ylabel('Cost-Efficiency (CE)', color='tab:blue', fontsize=28)
@@ -261,11 +249,19 @@ def plot_grouped_bars(ax, results_dict, x_positions, x_ticklabels, group_key_fn)
         try:
             _key, key_ = label.split('-', 1)
         except ValueError:
-            key_ = 'DR'
+            key_ = 'RR'
         color = plt.cm.get_cmap('tab10')(group_to_color_idx[group_key_fn(label)] % 10)
 
+        y_means = data['dr']
+        y_errs = data.get('ci', None)
+
         x = x_positions + (i - (num_series - 1) / 2) * bar_width
-        ax.bar(x, data['dr'], width=bar_width, label=label, **bar_style_kwargs(key_, color))
+        ax.bar(
+            x, y_means, width=bar_width, label=label,
+            yerr=y_errs, capsize=3,
+            error_kw={'elinewidth': 1.2, 'alpha': 0.9},
+            **bar_style_kwargs(key_, color)
+        )
 
     ax.set_xticks(x_positions)
     ax.set_xticklabels(x_ticklabels)
@@ -376,7 +372,8 @@ def plot_protocols_vs_budget(excel_writer, output_dir, user_sets_list):
     cost_budgets = COST_BUDGETS
 
     all_plot_data = []
-    results = {f'{sm}-{p}': {'ce_actual': [], 'dr': []} for p in protocols for sm in source_methods}
+    results = {f'{sm}-{p}': {'ce_actual': [], 'dr': [], 'ci': []}
+               for p in protocols for sm in source_methods}
 
     for method in source_methods:
         for protocol in protocols:
@@ -392,6 +389,7 @@ def plot_protocols_vs_budget(excel_writer, output_dir, user_sets_list):
                 summary = run_and_get_metrics(params, user_sets_list)
 
                 results[label]['dr'].append(summary['average_dr'])
+                results[label]['ci'].append(summary['ci95_halfwidth'])  # 新增
 
                 row = {
                     'Protocol': protocol, 'Source Method': method, 'Budget': budget,
@@ -410,8 +408,8 @@ def plot_protocols_vs_budget(excel_writer, output_dir, user_sets_list):
         group_key_fn=lambda lbl: lbl.split('-', 1)[0]
     )
 
-    current_ylim = ax.get_ylim()
-    ax.set_ylim(current_ylim[0], current_ylim[1] * 1.1)
+    # current_ylim = ax.get_ylim()
+    # ax.set_ylim(current_ylim[0], current_ylim[1] * 1.05)
 
     place_legend_inside(ax, loc='upper left')
     fig.subplots_adjust(left=0.15)
@@ -433,7 +431,8 @@ def plot_mpp_op_var(excel_writer, output_dir, user_sets_list):
     protocols = ['PR', 'RR']
 
     all_plot_data = []
-    results = {f'{sm}-{p}': {'ce_actual': [], 'dr': []} for p in protocols for sm in source_methods}
+    results = {f'{sm}-{p}': {'ce_actual': [], 'dr': [], 'ci': []}
+               for p in protocols for sm in source_methods}
 
     for method in source_methods:
         for protocol in protocols:
@@ -450,6 +449,7 @@ def plot_mpp_op_var(excel_writer, output_dir, user_sets_list):
                 summary = run_and_get_metrics(params, user_sets_list)
 
                 results[label]['dr'].append(summary['average_dr'])
+                results[label]['ci'].append(summary['ci95_halfwidth'])  # 新增
 
                 row = {
                     'Protocol': protocol,
@@ -471,8 +471,9 @@ def plot_mpp_op_var(excel_writer, output_dir, user_sets_list):
     )
 
     # plot_grouped_lines(ax, results, p_ops)
+
     # current_ylim = ax.get_ylim()
-    # ax.set_ylim(current_ylim[0], current_ylim[1] * 1.1)
+    # ax.set_ylim(current_ylim[0], current_ylim[1] * 1.05)
 
     place_legend_inside(ax)
     fig.subplots_adjust(left=0.15)
@@ -494,7 +495,8 @@ def plot_mpp_scalability_network_size_var(excel_writer, output_dir, base_user_se
     protocols = ['PR', 'RR']
 
     all_plot_data = []
-    results = {f'{sm}-{p}': {'ce_actual': [], 'dr': []} for p in protocols for sm in source_methods}
+    results = {f'{sm}-{p}': {'ce_actual': [], 'dr': [], 'ci': []}
+               for p in protocols for sm in source_methods}
 
     for method in source_methods:
         for protocol in protocols:
@@ -511,6 +513,7 @@ def plot_mpp_scalability_network_size_var(excel_writer, output_dir, base_user_se
                 summary = run_and_get_metrics(params, user_sets_list)
 
                 results[label]['dr'].append(summary['average_dr'])
+                results[label]['ci'].append(summary['ci95_halfwidth'])  # 新增
 
                 row = {
                     'Protocol': protocol,
@@ -531,8 +534,8 @@ def plot_mpp_scalability_network_size_var(excel_writer, output_dir, base_user_se
         group_key_fn=lambda lbl: lbl.split('-', 1)[0]  # '3x3' / '4x4' / '5x5'
     )
 
-    current_ylim = ax.get_ylim()
-    ax.set_ylim(current_ylim[0], current_ylim[1] * 1.1)
+    # current_ylim = ax.get_ylim()
+    # ax.set_ylim(current_ylim[0], current_ylim[1] * 1.05)
 
     place_legend_inside(ax)
     fig.tight_layout()
@@ -554,7 +557,8 @@ def plot_mpp_scalability_users_var(excel_writer, output_dir, base_user_sets_list
     protocols = ['PR', 'RR']
 
     all_plot_data = []
-    results = {f'{sm}-{p}': {'ce_actual': [], 'dr': []} for p in protocols for sm in source_methods}
+    results = {f'{sm}-{p}': {'ce_actual': [], 'dr': [], 'ci': []}
+               for p in protocols for sm in source_methods}
 
     for method in source_methods:
         for protocol in protocols:
@@ -571,6 +575,7 @@ def plot_mpp_scalability_users_var(excel_writer, output_dir, base_user_sets_list
                 summary = run_and_get_metrics(params, user_sets_list)
 
                 results[label]['dr'].append(summary['average_dr'])
+                results[label]['ci'].append(summary['ci95_halfwidth'])  # 新增
 
                 row = {
                     'Protocol': protocol,
@@ -583,15 +588,15 @@ def plot_mpp_scalability_users_var(excel_writer, output_dir, base_user_sets_list
 
     pd.DataFrame(all_plot_data).to_excel(excel_writer, sheet_name='Fig4_NumUsers_Var', index=False)
 
-    fig, ax = create_dr_plot('Protocols vs Number of Users', x_label='Number of Users', figuresize=(8, 6))
+    fig, ax = create_dr_plot('Protocols vs Number of Users', x_label='Number of Users', figuresize=(8, 6.5))
     x_positions = np.arange(len(num_users_list), dtype=float)
     plot_grouped_bars(
         ax, results, x_positions, [str(n) for n in num_users_list],
         group_key_fn=lambda lbl: lbl.split('-', 1)[0]  # '3users' / '4users' / '5users'
     )
 
-    current_ylim = ax.get_ylim()
-    ax.set_ylim(current_ylim[0], current_ylim[1] * 1.1)
+    # current_ylim = ax.get_ylim()
+    # ax.set_ylim(current_ylim[0], current_ylim[1] * 1.05)
 
     place_legend_inside(ax, loc='upper right', bbox_to_anchor=(0.98, 0.98))
     fig.subplots_adjust(left=0.15)
@@ -613,7 +618,8 @@ def plot_mpp_decoherence_var(excel_writer, output_dir, user_sets_list):
     protocols = ['PR', 'RR']
 
     all_plot_data = []
-    results = {f'{sm}-{p}': {'ce_actual': [], 'dr': []} for p in protocols for sm in source_methods}
+    results = {f'{sm}-{p}': {'ce_actual': [], 'dr': [], 'ci': []}
+               for p in protocols for sm in source_methods}
 
     for method in source_methods:
         for protocol in protocols:
@@ -633,6 +639,7 @@ def plot_mpp_decoherence_var(excel_writer, output_dir, user_sets_list):
                 summary = run_and_get_metrics(params, user_sets_list)
 
                 results[label]['dr'].append(summary['average_dr'])
+                results[label]['ci'].append(summary['ci95_halfwidth'])  # 新增
 
                 row = {
                     'Protocol': protocol,
@@ -652,9 +659,8 @@ def plot_mpp_decoherence_var(excel_writer, output_dir, user_sets_list):
         group_key_fn=lambda lbl: lbl.split('-', 1)[0]  # 'dt1' / 'dt2' ...
     )
 
-
-    current_ylim = ax.get_ylim()
-    ax.set_ylim(current_ylim[0], current_ylim[1] * 1.1)
+    # current_ylim = ax.get_ylim()
+    # ax.set_ylim(current_ylim[0], current_ylim[1] * 1.05)
 
     place_legend_inside(ax)
     fig.tight_layout()

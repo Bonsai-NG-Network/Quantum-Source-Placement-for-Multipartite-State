@@ -25,6 +25,7 @@ class QuantumNetwork:
         if attr is None:
             length_km = self.topo.get_edge_length(node1, node2)
         else:
+            # swapping
             length_km = 0
             p_op = 1
 
@@ -54,19 +55,19 @@ class QuantumNetwork:
             node.memory.memory_storage = {}
         self.entanglementlink_manager.links = []
         self.entanglementlink_manager.slot_counter = {}
-
-
-if __name__ == "__main__":
-    # A - B - C - D
-    edge_list = [
-        ("A", "B", 10),
-        ("B", "C", 15),
-        ("C", "D", 20)
-    ]
-
-    net = QuantumNetwork(edge_list=edge_list, max_per_edge=4, decoherence_time=6)
-    # net = QuantumNetwork(length_network=3, width_network=3, edge_length_km=1, max_per_edge=4, decoherence_time=6)
-    net.attempt_entanglement("A", "B", p_op=0.9, gen_time=0)
-    net.attempt_entanglement("B", "C", p_op=0.9, gen_time=4)
-    net.show_network_status(current_time=5)
-    net.show_network_status(current_time=9)
+#
+#
+# if __name__ == "__main__":
+#     # A - B - C - D
+#     edge_list = [
+#         ("A", "B", 10),
+#         ("B", "C", 15),
+#         ("C", "D", 20)
+#     ]
+#
+#     net = QuantumNetwork(edge_list=edge_list, max_per_edge=4, decoherence_time=6)
+#     # net = QuantumNetwork(length_network=3, width_network=3, edge_length_km=1, max_per_edge=4, decoherence_time=6)
+#     net.attempt_entanglement("A", "B", p_op=0.9, gen_time=0)
+#     net.attempt_entanglement("B", "C", p_op=0.9, gen_time=4)
+#     net.show_network_status(current_time=5)
+#     net.show_network_status(current_time=9)

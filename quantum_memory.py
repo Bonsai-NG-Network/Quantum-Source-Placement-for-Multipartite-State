@@ -26,7 +26,7 @@ import math
 
 
 class QuantumMemory:
-    def __init__(self, node_id, max_per_edge=1, decoherence_time=10, fidelity_decay=None, decay_rate=0.01):
+    def __init__(self, node_id, max_per_edge=1, decoherence_time=10, fidelity_decay=None, decay_rate=0.01, ):
         self.node_id = node_id
         self.max_per_edge = max_per_edge
         self.decoherence_time = decoherence_time
@@ -78,11 +78,3 @@ class QuantumMemory:
             return max(0.0, 1.0 - self.decay_rate * dt)
 
 
-if __name__ == "__main__":
-    memory = QuantumMemory(node_id="A", max_per_edge=3, decoherence_time=8, decay_rate=0.05)
-
-    memory.occupy_memory("B", 0, 1)
-    memory.occupy_memory("C", 5, 1)
-    memory.occupy_memory("D", 7, 1)
-    memory.show_memory(current_time=7)
-    memory.show_memory(current_time=9)

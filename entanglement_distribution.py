@@ -30,7 +30,9 @@ class EntanglementDistribution:
     def average_dr(self):
         if not self.successful_trials:
             return 0.0
-        return sum([num_ghz / t for t, num_ghz in self.successful_trials]) / len(self.successful_trials)
+        dr_list_trial = [num_ghz / t for t, num_ghz in self.successful_trials]
+        average_dr = sum(dr_list_trial) / len(self.successful_trials)
+        return average_dr, dr_list_trial
 
     def average_cost(self):
         if not self.cost_list:
@@ -68,11 +70,13 @@ class EntanglementDistribution:
 
     def get_summary_dict(self):
         """Returns a dictionary containing the summary statistics."""
+        average_dr_value, dr_list_trial = self.average_dr()
         return {
             "successful_runs": len(self.successful_trials),
             "failed_runs": self.failed_trials_num,
             "failure_rate": self.failure_rate(),
-            "average_dr": self.average_dr(),
+            "average_dr": average_dr_value,
+            "dr_list_trial": dr_list_trial,
             "average_cost": self.average_cost(),
             "cost_efficiency_actual": self.cost_efficiency_actual(),
             "cost_efficiency_budget": self.cost_efficiency_budget(),
