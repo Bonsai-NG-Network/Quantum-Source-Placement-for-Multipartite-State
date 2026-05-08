@@ -54,14 +54,77 @@ OP_DT_5 = 0.8
 DT_LIST_5 = [1, 2, 3, 4]
 
 
-EDGE_LIST = [
-    (0, 1, 10), (1, 2, 10),
-    (3, 4, 10), (4, 5, 10),
-    (6, 7, 10), (7, 8, 10),
+# EDGE_LIST = [
+#     (0, 1, 10), (1, 2, 10),
+#     (3, 4, 10), (4, 5, 10),
+#     (6, 7, 10), (7, 8, 10),
+#
+#     (0, 3, 10), (1, 4, 10), (2, 5, 10),
+#     (3, 6, 10), (4, 7, 10), (5, 8, 10),
+# ]
+#
+# FIXED_BUDGET = 12
+# COST_BUDGETS = list(range(12, 32, 4))
 
-    (0, 3, 10), (1, 4, 10), (2, 5, 10),
-    (3, 6, 10), (4, 7, 10), (5, 8, 10),
+# # 4x4
+# EDGE_LIST= [
+#     (0, 1, 10), (1, 2, 10), (2, 3, 10),
+#     (4, 5, 10), (5, 6, 10), (6, 7, 10),
+#     (8, 9, 10), (9, 10, 10), (10, 11, 10),
+#     (12, 13, 10), (13, 14, 10), (14, 15, 10),
+#
+#     (0, 4, 10), (1, 5, 10), (2, 6, 10), (3, 7, 10),
+#     (4, 8, 10), (5, 9, 10), (6, 10, 10), (7, 11, 10),
+#     (8, 12, 10), (9, 13, 10), (10, 14, 10), (11, 15, 10),
+# ]
+#
+# FIXED_BUDGET = 24
+# COST_BUDGETS = list(range(24, 44, 4))
+
+# 5x5
+EDGE_LIST = [
+    (0, 1, 10), (1, 2, 10), (2, 3, 10), (3, 4, 10),
+    (5, 6, 10), (6, 7, 10), (7, 8, 10), (8, 9, 10),
+    (10, 11, 10), (11, 12, 10), (12, 13, 10), (13, 14, 10),
+    (15, 16, 10), (16, 17, 10), (17, 18, 10), (18, 19, 10),
+    (20, 21, 10), (21, 22, 10), (22, 23, 10), (23, 24, 10),
+
+    (0, 5, 10), (1, 6, 10), (2, 7, 10), (3, 8, 10), (4, 9, 10),
+    (5, 10, 10), (6, 11, 10), (7, 12, 10), (8, 13, 10), (9, 14, 10),
+    (10, 15, 10), (11, 16, 10), (12, 17, 10), (13, 18, 10), (14, 19, 10),
+    (15, 20, 10), (16, 21, 10), (17, 22, 10), (18, 23, 10), (19, 24, 10),
 ]
+
+FIXED_BUDGET = 40
+COST_BUDGETS = list(range(40, 60, 4))
+
+# EDGE_LIST = [
+#                 ("Setagaya", "Ota", 12.045),
+#                 ("Setagaya", "Shinagawa", 9.072),
+#                 ("Setagaya", "Minato", 9.945),
+#                 ("Setagaya", "Shinjuku", 7.916),
+#                 ("Setagaya", "Nerima", 10.885),
+#                 ("Ota", "Shinagawa", 6.464),
+#                 ("Shinagawa", "Minato", 6.788),
+#                 ("Minato", "Koto", 7.195),
+#                 ("Minato", "Chiyoda", 4.972),
+#                 ("Shinjuku", "Minato", 6.878),
+#                 ("Shinjuku", "Chiyoda", 5.461),
+#                 ("Shinjuku", "Itabashi", 7.446),
+#                 ("Shinjuku", "Nerima", 7.504),
+#                 ("Nerima", "Itabashi", 6.341),
+#                 ("Koto", "Edogawa", 6.868),
+#                 ("Chiyoda", "Koto", 7.248),
+#                 ("Chiyoda", "Edogawa", 11.528),
+#                 ("Chiyoda", "Bunkyo", 2.601),
+#                 ("Bunkyo", "Adachi", 9.701),
+#                 ("Itabashi", "Bunkyo", 7.239),
+#                 ("Edogawa", "Adachi", 10.682)
+#             ]
+#
+# FIXED_BUDGET = 21
+# COST_BUDGETS = list(range(21, 41, 4))
+
 
 
 def nodes_from_edge_list(edge_list):
@@ -69,13 +132,6 @@ def nodes_from_edge_list(edge_list):
     for u, v, *rest in edge_list:
         nodes.add(u); nodes.add(v)
     return sorted(nodes)
-
-
-# FIXED_BUDGET = 21
-# COST_BUDGETS = list(range(21, 40, 4))
-
-FIXED_BUDGET = 12
-COST_BUDGETS = list(range(12, 32, 4))
 
 
 def export_run_parameters(writer):
@@ -207,24 +263,24 @@ def place_legend_inside(ax, loc='upper left', bbox_to_anchor=(0.02, 0.98)):
 # ---------- Generic plotting helpers ----------
 def create_dr_plot(title, x_label, figuresize=(11, 6.5)):
     fig, ax = plt.subplots(figsize=figuresize)
-    ax.set_xlabel(x_label, fontsize=28)
-    ax.set_ylabel('Distribution Rate', fontsize=28)
+    ax.set_xlabel(x_label, fontsize=20)
+    ax.set_ylabel(r'DR $(GHZ_{\mathrm{N}}/T_{\mathrm{slot}})$', fontsize=20)
     ax.grid(True, which='both', linestyle='--', linewidth=1, axis='y')
-    # ax.set_title(title, fontsize=28)
-    ax.tick_params(axis='both', labelsize=28)
+    # ax.set_title(title, fontsize=20)
+    ax.tick_params(axis='both', labelsize=20)
     return fig, ax
 
 
 def create_combo_plot(title, x_label):
     fig, ax1 = plt.subplots(figsize=(11, 6.5))
     ax2 = ax1.twinx()
-    ax1.set_xlabel(x_label, fontsize=28)
-    ax1.set_ylabel('Cost-Efficiency (CE)', color='tab:blue', fontsize=28)
-    ax2.set_ylabel('Distribution Rate (DR)', color='tab:red', fontsize=28)
+    ax1.set_xlabel(x_label, fontsize=20)
+    ax1.set_ylabel('Cost-Efficiency (CE)', color='tab:blue', fontsize=20)
+    ax2.set_ylabel('Distribution Rate (DR)', color='tab:red', fontsize=20)
     ax1.tick_params(axis='y', labelcolor='tab:blue')
     ax2.tick_params(axis='y', labelcolor='tab:red')
     ax1.grid(True, which='both', linestyle='--', linewidth=0.5, axis='y')
-    ax1.set_title(title, fontsize=28)
+    ax1.set_title(title, fontsize=20)
     return fig, ax1, ax2
 
 

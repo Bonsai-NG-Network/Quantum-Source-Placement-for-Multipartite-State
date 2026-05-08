@@ -29,7 +29,7 @@ class EntanglementDistribution:
 
     def average_dr(self):
         if not self.successful_trials:
-            return 0.0
+            return 0.0, []
         dr_list_trial = [num_ghz / t for t, num_ghz in self.successful_trials]
         average_dr = sum(dr_list_trial) / len(self.successful_trials)
         return average_dr, dr_list_trial
