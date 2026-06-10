@@ -31,6 +31,7 @@ from multipath_routing import MPGreedyRouting, MPCooperativeRouting, MPPackingRo
 from network_request import RequestGenerator
 from quantum_source_placement import SourcePlacement
 from quantum_source_placement_backup import SourcePlacementBackup
+from quantum_source_placement_betweenness import BetweennessSourcePlacement
 from quantum_source_placement_dp import SourcePlacementDP
 from seed_utils import derive_seed, set_global_seed
 from singlepath_routing import SPEntanglementRouting
@@ -44,10 +45,12 @@ class AlgorithmConfig:
 
 
 DEFAULT_ALGORITHMS = (
-    AlgorithmConfig("NOP-singlepath_star", "NOP", "singlepath_star"),
-    AlgorithmConfig("NOP-multipath_tree_packing", "NOP", "multipath_tree_packing"),
-    AlgorithmConfig("OP-singlepath_star", "OP", "singlepath_star"),
-    AlgorithmConfig("OP-multipath_tree_packing", "OP", "multipath_tree_packing"),
+    AlgorithmConfig("ALL_EDGES_RR-singlepath_star", "NOP", "singlepath_star"),
+    AlgorithmConfig("ALL_EDGES_RR-multipath_tree_packing", "NOP", "multipath_tree_packing"),
+    AlgorithmConfig("DP_UNION-singlepath_star", "OP", "singlepath_star"),
+    AlgorithmConfig("DP_UNION-multipath_tree_packing", "OP", "multipath_tree_packing"),
+    AlgorithmConfig("BETWEENNESS-singlepath_star", "BETWEENNESS", "singlepath_star"),
+    AlgorithmConfig("BETWEENNESS-multipath_tree_packing", "BETWEENNESS", "multipath_tree_packing"),
 )
 
 ILP_ALGORITHMS = (
@@ -191,6 +194,18 @@ def place_sources_for_batch(
             seed=seed,
         )
         return sources, placer.compute_cost(), {}
+
+    if source_method == "BETWEENNESS":
+        placer = BetweennessSourcePlacement(simulator.topo)
+        sources = placer.place_sources(
+            cost_budget=cost_budget,
+            max_per_edge=simulator.max_per_edge,
+        )
+        metadata = {
+            "betweenness_scores": placer.edge_scores,
+            "allocation": placer.allocation(),
+        }
+        return sources, placer.compute_cost(), metadata
 
     if source_method == "ILP":
         from ilp_multipartite_source_placement import solve_single_slot_ilp_request_batch
