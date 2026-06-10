@@ -4,13 +4,20 @@ from entanglement_swapping import EntanglementSwapping
 from entanglement_fusion import EntanglementFusion
 from quantum_source_placement import SourcePlacement
 from steiner_tree_algorithms import approximate_steiner_tree, has_connecting_tree
+from tree_operation_planner import (
+    build_tree_from_paths,
+    build_tree_operation_plan,
+    execute_tree_operation_plan,
+)
 from collections import Counter
 import matplotlib.pyplot as plt
 
 
 class MPGreedyRouting:
-    def __init__(self, network, user_set, p_op):
+    def __init__(self, network, user_set, p_op, q_swap=1.0, q_fus=1.0):
         self.p_op = p_op
+        self.q_swap = q_swap
+        self.q_fus = q_fus
         self.network = network
         self.G = self.network.topo  # original physical topology
         self.link_manager = network.entanglementlink_manager
@@ -55,7 +62,7 @@ class MPGreedyRouting:
                 paths[s] = []
         return paths
 
-    def mp_greedy_routing(self, vc, max_timeslot, deployed_sources):
+    def multipath_star_routing(self, vc, max_timeslot, deployed_sources):
         time_slot = 0
         hasGHZ = False
 
@@ -77,26 +84,39 @@ class MPGreedyRouting:
             for s, path in paths.items():
                 print(f"  {vc} -> {s}: {path}")
 
-            S_prime = [u for u in self.user_set if u != vc and not self._has_shared_bell_pair(u, vc)]
-            for s in S_prime:
-                path = paths.get(s, [])
-                if path:
-                    # Swapping logic needs to handle multiple links per edge
-                    self.swapping.entanglement_swapping(path=path, current_time=time_slot, p_op=self.p_op)
-
-            remote_users = [u for u in self.user_set if u != vc]
-            if all(self._has_shared_bell_pair(u, vc) for u in remote_users):
-                success = self.fusion.fuse_users(vc, user_list=self.user_set, current_time=time_slot, p_op=self.p_op)
+            if all(path for path in paths.values()):
+                star_tree = build_tree_from_paths(paths)
+                plan = build_tree_operation_plan(
+                    star_tree,
+                    self.user_set,
+                    p_op=1.0,
+                    q_swap=self.q_swap,
+                    q_fus=self.q_fus,
+                    forced_fusion_nodes=[vc],
+                )
+                success = execute_tree_operation_plan(
+                    self.swapping,
+                    self.fusion,
+                    plan,
+                    current_time=time_slot,
+                    q_swap=self.q_swap,
+                    q_fus=self.q_fus,
+                )
                 if success:
                     print(f"[Fusion] GHZ generated at vc={vc}")
                     hasGHZ = True
 
         return time_slot
 
+    def mp_greedy_routing(self, vc, max_timeslot, deployed_sources):
+        return self.multipath_star_routing(vc, max_timeslot, deployed_sources)
+
 
 class MPCooperativeRouting:
-    def __init__(self, network, user_set, p_op):
+    def __init__(self, network, user_set, p_op, q_swap=1.0, q_fus=1.0):
         self.p_op = p_op
+        self.q_swap = q_swap
+        self.q_fus = q_fus
         self.network = network
         self.G = self.network.topo.graph  # original physical topology
         self.link_manager = network.entanglementlink_manager
@@ -126,7 +146,7 @@ class MPCooperativeRouting:
                 return True
         return False
 
-    def mpc_routing(self, max_timeslot, deployed_sources):
+    def multipath_tree_routing(self, max_timeslot, deployed_sources):
         time_slot = 0
         hasGHZ = False
 
@@ -155,19 +175,30 @@ class MPCooperativeRouting:
             if has_connecting_tree(G_prime, self.user_set):
                 R = approximate_steiner_tree(G_prime, self.user_set)
                 print(f"Steiner tree is {R}")
-                used_links = set(R.edges())
-
-                success = self.fusion.fuse_users_from_tree(user_list=self.user_set, tree_links=used_links, current_time=time_slot, p_op=self.p_op)
+                plan = build_tree_operation_plan(R, self.user_set, p_op=1.0, q_swap=self.q_swap, q_fus=self.q_fus)
+                success = execute_tree_operation_plan(
+                    self.swapping,
+                    self.fusion,
+                    plan,
+                    current_time=time_slot,
+                    q_swap=self.q_swap,
+                    q_fus=self.q_fus,
+                )
                 if success:
                     print(f"[Fusion] GHZ generated via a Steiner tree.")
                     hasGHZ = True
 
         return time_slot
 
+    def mpc_routing(self, max_timeslot, deployed_sources):
+        return self.multipath_tree_routing(max_timeslot, deployed_sources)
+
 
 class MPPackingRouting:
-    def __init__(self, network, user_set, p_op):
+    def __init__(self, network, user_set, p_op, q_swap=1.0, q_fus=1.0):
         self.p_op = p_op
+        self.q_swap = q_swap
+        self.q_fus = q_fus
         self.network = network
         self.G = self.network.topo.graph
         self.link_manager = network.entanglementlink_manager
@@ -197,7 +228,7 @@ class MPPackingRouting:
                 return True
         return False
 
-    def mpp_routing(self, max_timeslot, deployed_sources):
+    def multipath_tree_packing_routing(self, max_timeslot, deployed_sources):
         time_slot = 0
         hasGHZ = False
         num_ghz_in_slot = 0
@@ -227,9 +258,16 @@ class MPPackingRouting:
 
             while has_connecting_tree(G_prime, self.user_set):
                 R = approximate_steiner_tree(G_prime, self.user_set)
-                used_links = set(R.edges())
+                plan = build_tree_operation_plan(R, self.user_set, p_op=1.0, q_swap=self.q_swap, q_fus=self.q_fus)
 
-                success = self.fusion.fuse_users_from_tree(self.user_set, used_links, time_slot, self.p_op)
+                success = execute_tree_operation_plan(
+                    self.swapping,
+                    self.fusion,
+                    plan,
+                    current_time=time_slot,
+                    q_swap=self.q_swap,
+                    q_fus=self.q_fus,
+                )
 
                 if success:
                     print(f"[Fusion] GHZ generated via a Steiner tree. (Packing #{num_ghz_in_slot + 1})")
@@ -252,6 +290,9 @@ class MPPackingRouting:
                 hasGHZ = True
 
         return time_slot, num_ghz_in_slot
+
+    def mpp_routing(self, max_timeslot, deployed_sources):
+        return self.multipath_tree_packing_routing(max_timeslot, deployed_sources)
 
 
 # if __name__ == "__main__":
@@ -301,3 +342,72 @@ class MPPackingRouting:
 #         print("[FAILURE] Protocol did not succeed within time limit")
 #
 #     net.show_network_status(current_time=final_time)
+
+
+def main():
+    edge_list = [
+        ("A", "X", 0),
+        ("X", "E", 0),
+        ("E", "B", 0),
+        ("E", "C", 0),
+    ]
+    user_set = ["A", "B", "C"]
+
+    network = QuantumNetwork(edge_list=edge_list, max_per_edge=2, decoherence_time=10)
+    for u, v, _ in edge_list:
+        network.attempt_entanglement(u, v, p_op=1.0, gen_time=0, flag=True)
+
+    tree = nx.Graph()
+    for u, v, _ in edge_list:
+        tree.add_edge(u, v, length_km=10)
+
+    router = MPPackingRouting(network, user_set, p_op=1.0, q_swap=1.0, q_fus=1.0)
+    plan = build_tree_operation_plan(tree, user_set, p_op=1.0, q_swap=1.0, q_fus=1.0)
+    assert plan.swap_nodes == ["X"]
+    assert plan.candidate_removal_nodes == ["E"]
+    assert execute_tree_operation_plan(
+        router.swapping,
+        router.fusion,
+        plan,
+        current_time=1,
+        q_swap=1.0,
+        q_fus=1.0,
+    )
+
+    ghz_links = [link for link in network.entanglementlink_manager.links if link.state_type == "GHZ"]
+    assert len(ghz_links) == 1
+    assert set(ghz_links[0].nodes) == set(user_set)
+    assert network.nodes["A"].get_memory_usage() == 1
+    assert network.nodes["B"].get_memory_usage() == 1
+    assert network.nodes["C"].get_memory_usage() == 1
+    assert network.nodes["E"].get_memory_usage() == 0
+    assert network.nodes["X"].get_memory_usage() == 0
+
+    network = QuantumNetwork(edge_list=edge_list, max_per_edge=2, decoherence_time=10)
+    for u, v, _ in edge_list:
+        network.attempt_entanglement(u, v, p_op=1.0, gen_time=0, flag=True)
+    router = MPPackingRouting(network, user_set, p_op=1.0, q_swap=0.0, q_fus=1.0)
+    plan = build_tree_operation_plan(tree, user_set, p_op=1.0, q_swap=0.0, q_fus=1.0)
+    assert not execute_tree_operation_plan(
+        router.swapping,
+        router.fusion,
+        plan,
+        current_time=1,
+        q_swap=0.0,
+        q_fus=1.0,
+    )
+    ghz_links = [link for link in network.entanglementlink_manager.links if link.state_type == "GHZ"]
+    assert not ghz_links
+
+    network = QuantumNetwork(edge_list=edge_list, max_per_edge=2, decoherence_time=10)
+    deployed = {tuple(sorted((u, v))): 1 for u, v, _ in edge_list}
+    router = MPPackingRouting(network, user_set, p_op=1.0, q_swap=1.0, q_fus=1.0)
+    final_time, num_ghz = router.multipath_tree_packing_routing(max_timeslot=4, deployed_sources=deployed)
+    assert final_time > 0
+    assert num_ghz > 0
+
+    print("multipath_routing main test passed.")
+
+
+if __name__ == "__main__":
+    main()

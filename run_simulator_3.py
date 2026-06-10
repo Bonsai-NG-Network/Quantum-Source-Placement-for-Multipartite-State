@@ -244,7 +244,7 @@ def line_style_for(method: str) -> str:
 
 
 def bar_style_kwargs(method: str, color):
-    if method == 'PR':
+    if method in {'PR', 'singlepath_star', 'multipath_star'}:
         return dict(color=color, alpha=0.75)
     else:
         return dict(facecolor='none', edgecolor=color, hatch='//', linewidth=1.5)
@@ -332,7 +332,7 @@ def color_for_method(method: str):
 
 def linestyle_for_protocol(protocol: str):
     # SR 实线，DR 虚线（可继续扩展 MP 等）
-    return '-' if protocol == 'PR' else '--'
+    return '-' if protocol in {'PR', 'singlepath_star', 'multipath_star'} else '--'
 
 # --- 简单平滑工具（有 scipy 用 savgol，没有就移动平均） ---
 def _smooth_array(y, window=9, poly=3):
@@ -422,7 +422,7 @@ def plot_protocols_vs_budget(excel_writer, output_dir, user_sets_list):
     print("###   GENERATING FIG.1: Protocols vs Budget   ###")
     print("#" * 60)
 
-    protocols = ['PR', 'RR']
+    protocols = ['singlepath_star', 'multipath_tree_packing']
     # source_methods = ["NOP", "OP_DP", "OP_BP"]
     source_methods = ["NOP", "OP"]
     cost_budgets = COST_BUDGETS
@@ -484,7 +484,7 @@ def plot_mpp_op_var(excel_writer, output_dir, user_sets_list):
     p_ops = P_OP_LIST_2
     # source_methods = ["NOP", "OP", "OP_BP"]
     source_methods = ["NOP", "OP"]
-    protocols = ['PR', 'RR']
+    protocols = ['singlepath_star', 'multipath_tree_packing']
 
     all_plot_data = []
     results = {f'{sm}-{p}': {'ce_actual': [], 'dr': [], 'ci': []}
@@ -548,7 +548,7 @@ def plot_mpp_scalability_network_size_var(excel_writer, output_dir, base_user_se
     sizes = NET_SIZES_3
     # source_methods = ["NOP", "OP", "OP_BP"]
     source_methods = ["NOP", "OP"]
-    protocols = ['PR', 'RR']
+    protocols = ['singlepath_star', 'multipath_tree_packing']
 
     all_plot_data = []
     results = {f'{sm}-{p}': {'ce_actual': [], 'dr': [], 'ci': []}
@@ -610,7 +610,7 @@ def plot_mpp_scalability_users_var(excel_writer, output_dir, base_user_sets_list
     num_users_list = NUM_USERS_LIST_4
     # source_methods = ["NOP", "OP_DP", "OP_BP"]
     source_methods = ["NOP", "OP"]
-    protocols = ['PR', 'RR']
+    protocols = ['singlepath_star', 'multipath_tree_packing']
 
     all_plot_data = []
     results = {f'{sm}-{p}': {'ce_actual': [], 'dr': [], 'ci': []}
@@ -671,7 +671,7 @@ def plot_mpp_decoherence_var(excel_writer, output_dir, user_sets_list):
     dt_list = DT_LIST_5
     # source_methods = ["NOP", "OP_DP", "OP_BP"]
     source_methods = ["NOP", "OP"]
-    protocols = ['PR', 'RR']
+    protocols = ['singlepath_star', 'multipath_tree_packing']
 
     all_plot_data = []
     results = {f'{sm}-{p}': {'ce_actual': [], 'dr': [], 'ci': []}

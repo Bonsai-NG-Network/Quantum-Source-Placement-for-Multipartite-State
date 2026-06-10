@@ -1,7 +1,18 @@
 """
-Performs entanglement fusion on intermediate nodes (non-user) with multiple entangled links.
-Each such node fuses its connected users into a GHZ state.
+Entanglement fusion for multipartite GHZ generation.
+
+The unified interface is fuse_tree(): callers pass the already selected
+tree/reduced-tree and the fusion nodes identified by the tree planner.
+The old fuse_users() and fuse_users_from_tree() methods are kept as wrappers
+for existing routing code.
 """
+
+from __future__ import annotations
+
+import random
+from typing import Any, Dict, Iterable, List, Optional
+
+import networkx as nx
 
 from quantum_network import QuantumNetwork
 
@@ -11,111 +22,182 @@ class EntanglementFusion:
         self.network = network
         self.link_manager = network.entanglementlink_manager
 
-    def fuse_users(self, intermediate_node, user_list, current_time, p_op):
-        # Step 1: Validate all required links exist and get their IDs
-        links_to_fuse = {}
-        for u in user_list:
-            if u != intermediate_node:
-                link_id = self._find_link_id(u, intermediate_node)
-                if link_id is None:
-                    print(f"[Fusion] Missing Bell pair: {u}–{intermediate_node}")
-                    return False
-                links_to_fuse[(u, intermediate_node)] = link_id
+    def fuse_tree(
+        self,
+        user_list: Iterable[Any],
+        reduced_tree: nx.Graph,
+        fusion_nodes: Iterable[Any],
+        current_time: int,
+        q_fus: float = 1.0,
+        q_fus_by_node: Optional[Dict[Any, float]] = None,
+        candidate_removal_nodes: Optional[Iterable[Any]] = None,
+    ) -> bool:
+        user_list = list(user_list)
+        fusion_nodes = list(fusion_nodes)
+        candidate_removal_nodes = list(candidate_removal_nodes or [])
 
-        # Step 2: Remove old links and memory
-        for u in user_list:
-            if u != intermediate_node:
-                link_id = links_to_fuse.get((u, intermediate_node))
-                self._remove_link_by_id(link_id)
-                self._release_memory(u, intermediate_node, link_id)
-                self._release_memory(intermediate_node, u, link_id)
-
-        # Step 3: Create new GHZ link among users
-        self.link_manager.create_link(user_list, p_op=1, gen_time=current_time, length_km=0, attr="Fusion")
-
-        # Step 4: Update memory (pairwise occupancy)
-        for u in user_list:
-            for v in user_list:
-                if u != v:
-                    # Note: You need to decide how to represent the new GHZ link in memory
-                    # For now, we don't assign it a new link_id as it's a multipartite state.
-                    self.network.nodes[u].memory.occupy_memory(v, 0, current_time)
-
-        print(f"[Fusion] GHZ state created among {user_list} via {intermediate_node}")
-        return True
-
-    def fuse_users_from_tree(self, user_list, tree_links, current_time, p_op):
-        # The paper assumes a GHZ can be formed if a connecting tree exists.
-        # This method simulates the process of swapping and fusing along the tree.
-        # For simplicity, we assume this is always successful if the links exist.
-
-        # Step 1: Remove all links in the tree and their corresponding memory entries
-        for u, v in tree_links:
+        links_to_consume = []
+        for u, v in reduced_tree.edges():
             link_id = self._find_link_id(u, v)
             if link_id is None:
-                 print(f"[Fusion] Missing link {u}-{v} in tree.")
-                 return False
-            self._remove_link_by_id(link_id)
-            self._release_memory(u, v, link_id)
-            self._release_memory(v, u, link_id)
+                print(f"[Fusion] Missing link {u}-{v} in tree.")
+                return False
+            links_to_consume.append(link_id)
 
-        # Step 2: Create a new GHZ link among the users
-        self.link_manager.create_link(user_list, p_op=1, gen_time=current_time, length_km=0, attr="Fusion")
+        fusion_success = True
+        failed_node = None
+        failed_q = None
+        for node in fusion_nodes:
+            q = self._probability_for_node(node, q_fus, q_fus_by_node)
+            if random.random() >= q:
+                fusion_success = False
+                failed_node = node
+                failed_q = q
+                break
 
-        # Step 3: Update memory for the new GHZ state
-        for u in user_list:
-            for v in user_list:
-                if u != v:
-                    # Note: You need to decide how to represent the new GHZ link in memory
-                    # For now, we don't assign it a new link_id as it's a multipartite state.
-                    self.network.nodes[u].memory.occupy_memory(v, 0, current_time)
+        self._consume_links(links_to_consume)
 
-        print(f"[Fusion] GHZ state created among {user_list} via tree")
+        if not fusion_success:
+            print(f"[Fusion] Failed at node {failed_node} (q_fus={failed_q:.4f})")
+            return False
 
+        success, ghz_link_id = self.link_manager.create_link(
+            user_list,
+            p_op=1,
+            gen_time=current_time,
+            length_km=0,
+            attr="Fusion",
+            flag=True,
+            state_type="GHZ",
+            operation="FUSION",
+            operation_node=fusion_nodes,
+            parent_link_ids=links_to_consume,
+        )
+
+        if not success:
+            return False
+
+        if not self.network.record_ghz_memory(user_list, ghz_link_id, current_time):
+            return False
+
+        for node in candidate_removal_nodes:
+            self._remove_non_user_ghz_memory(node, ghz_link_id)
+
+        print(f"[Fusion] GHZ state created among {user_list} via fusion nodes {fusion_nodes}")
         return True
 
-    def _link_exists(self, u, v):
-        for link in self.link_manager.links:
-            if u in link.nodes and v in link.nodes:
-                return True
-        return False
+    def fuse_users(
+        self,
+        intermediate_node,
+        user_list,
+        current_time,
+        p_op=None,
+        q_fus=1.0,
+        q_fus_by_node=None,
+    ):
+        tree = nx.Graph()
+        for user in user_list:
+            if user != intermediate_node:
+                tree.add_edge(user, intermediate_node)
+
+        return self.fuse_tree(
+            user_list=user_list,
+            reduced_tree=tree,
+            fusion_nodes=[intermediate_node],
+            current_time=current_time,
+            q_fus=q_fus,
+            q_fus_by_node=q_fus_by_node,
+            candidate_removal_nodes=[] if intermediate_node in user_list else [intermediate_node],
+        )
+
+    def fuse_users_from_tree(
+        self,
+        user_list,
+        tree_links,
+        current_time,
+        p_op=None,
+        fusion_nodes=None,
+        q_fus=1.0,
+        q_fus_by_node=None,
+        candidate_removal_nodes=None,
+    ):
+        tree = nx.Graph()
+        tree.add_edges_from(tree_links)
+
+        if fusion_nodes is None:
+            fusion_nodes = [node for node in tree.nodes() if tree.degree(node) >= 2]
+
+        if candidate_removal_nodes is None:
+            user_set = set(user_list)
+            candidate_removal_nodes = [node for node in tree.nodes() if node not in user_set]
+
+        return self.fuse_tree(
+            user_list=user_list,
+            reduced_tree=tree,
+            fusion_nodes=fusion_nodes,
+            current_time=current_time,
+            q_fus=q_fus,
+            q_fus_by_node=q_fus_by_node,
+            candidate_removal_nodes=candidate_removal_nodes,
+        )
+
+    def _consume_links(self, link_ids: Iterable[str]) -> None:
+        for link_id in link_ids:
+            self.link_manager.remove_link_by_id(link_id)
+            self.network.release_link_memory_everywhere(link_id)
+
+    def _remove_non_user_ghz_memory(self, node_id, ghz_link_id):
+        if node_id in self.network.nodes:
+            self.network.nodes[node_id].memory.release_by_link_id(ghz_link_id)
 
     def _find_link_id(self, u, v):
-        # Find the ID of a single active link between u and v
         for link in self.link_manager.links:
-            if u in link.nodes and v in link.nodes:
+            if len(link.nodes) == 2 and u in link.nodes and v in link.nodes:
                 return link.link_id
         return None
 
-    def _remove_link_by_id(self, link_id):
-        self.link_manager.remove_link_by_id(link_id)
+    def _probability_for_node(self, node_id, q_fus, q_fus_by_node):
+        if q_fus_by_node is not None:
+            return float(q_fus_by_node.get(node_id, q_fus))
+        return float(q_fus)
 
-    def _release_memory(self, node_id, peer_id, link_id):
-        mem = self.network.nodes[node_id].memory
-        if peer_id in mem.memory_storage:
-            mem.memory_storage[peer_id] = [
-                (l_id, gen_time, fidelity)
-                for l_id, gen_time, fidelity in mem.memory_storage[peer_id]
-                if l_id != link_id
-            ]
-            if not mem.memory_storage[peer_id]:
-                del mem.memory_storage[peer_id]
 
-#
-# if __name__=="__main__":
-#     # A —— D —— C
-#     #      |    |
-#     #      B ——
-#     edge_list = [("A", "D", 10), ("D", "C", 15), ("D", "B", 10), ("B", "C", 20)]
-#     net = QuantumNetwork(edge_list=edge_list, max_per_edge=2, decoherence_time=6)
-#
-#     net.attempt_entanglement("A", "D", p_op=0.9, gen_time=0)
-#     net.attempt_entanglement("B", "D", p_op=0.9, gen_time=4)
-#     net.attempt_entanglement("C", "D", p_op=0.9, gen_time=4)
-#
-#     print("\nBefore Fusion")
-#     net.show_network_status(current_time=4)
-#     fusion = EntanglementFusion(net)
-#     fusion.fuse_users("D", ["A", "B", "C"], current_time=5, p_op=0.9)
-#     print("\nAfter Fusion")
-#     net.show_network_status(current_time=5)
+def main():
+    edge_list = [
+        ("A", "D", 10),
+        ("B", "D", 10),
+        ("C", "D", 10),
+    ]
+
+    net = QuantumNetwork(edge_list=edge_list, max_per_edge=3, decoherence_time=6)
+    net.attempt_entanglement("A", "D", p_op=1.0, gen_time=0, flag=True)
+    net.attempt_entanglement("B", "D", p_op=1.0, gen_time=0, flag=True)
+    net.attempt_entanglement("C", "D", p_op=1.0, gen_time=0, flag=True)
+
+    fusion = EntanglementFusion(net)
+    assert fusion.fuse_users("D", ["A", "B", "C"], current_time=1, q_fus=1.0)
+    ghz_links = [link for link in net.entanglementlink_manager.links if link.state_type == "GHZ"]
+    assert len(ghz_links) == 1
+    assert set(ghz_links[0].nodes) == {"A", "B", "C"}
+    assert net.nodes["A"].get_memory_usage() == 1
+    assert net.nodes["B"].get_memory_usage() == 1
+    assert net.nodes["C"].get_memory_usage() == 1
+    assert net.nodes["D"].get_memory_usage() == 0
+
+    net = QuantumNetwork(edge_list=edge_list, max_per_edge=3, decoherence_time=6)
+    net.attempt_entanglement("A", "D", p_op=1.0, gen_time=0, flag=True)
+    net.attempt_entanglement("B", "D", p_op=1.0, gen_time=0, flag=True)
+    net.attempt_entanglement("C", "D", p_op=1.0, gen_time=0, flag=True)
+    fusion = EntanglementFusion(net)
+    assert not fusion.fuse_users("D", ["A", "B", "C"], current_time=1, q_fus=0.0)
+    assert not net.entanglementlink_manager.links
+    assert net.nodes["A"].get_memory_usage() == 0
+    assert net.nodes["B"].get_memory_usage() == 0
+    assert net.nodes["C"].get_memory_usage() == 0
+    assert net.nodes["D"].get_memory_usage() == 0
+
+    print("EntanglementFusion main test passed.")
+
+
+if __name__ == "__main__":
+    main()

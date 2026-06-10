@@ -5,7 +5,20 @@ import matplotlib.pyplot as plt
 
 
 class EntanglementLink:
-    def __init__(self, link_id, nodes, gen_time, length_km, p_op=0.9, loss_coef_dB_per_km=0.2, attr=None):
+    def __init__(
+        self,
+        link_id,
+        nodes,
+        gen_time,
+        length_km,
+        p_op=0.9,
+        loss_coef_dB_per_km=0.2,
+        attr=None,
+        state_type=None,
+        operation=None,
+        operation_node=None,
+        parent_link_ids=None,
+    ):
         self.link_id = link_id
         self.nodes = nodes  # list of nodes: ["A", "B"] or ["A", "B", "C"]
         self.gen_time = gen_time
@@ -13,6 +26,10 @@ class EntanglementLink:
         self.p_op = p_op
         self.loss_coef = loss_coef_dB_per_km
         self.attr = attr
+        self.state_type = state_type or self._infer_state_type(nodes, attr)
+        self.operation = operation or self._infer_operation(attr)
+        self.operation_node = operation_node
+        self.parent_link_ids = list(parent_link_ids or [])
 
         # Calculate link loss and entanglement generation probability
         self.p_loss = self.calculate_loss()
@@ -25,9 +42,26 @@ class EntanglementLink:
     def calculate_entanglement_prob(self):
         return self.p_op * (1 - self.p_loss)
 
+    @staticmethod
+    def _infer_state_type(nodes, attr):
+        if len(nodes) > 2:
+            return "GHZ"
+        if attr == "Swapping":
+            return "SWAPPED_BELL"
+        return "BELL"
+
+    @staticmethod
+    def _infer_operation(attr):
+        if attr == "Swapping":
+            return "SWAPPING"
+        if attr == "Fusion":
+            return "FUSION"
+        return "GENERATION"
+
     def show_entanglementlink_info(self):
         print(f"  Entanglement Link ID {self.link_id}, Nodes: {self.nodes}:")
         print(f"    Generate time: {self.gen_time}, Length_km: {self.length_km}, p_op: {self.p_op:.2f}, p_loss: {self.p_loss:.2f}, p_e: {self.p_e:.2f}, Via: {self.attr}")
+        print(f"    State: {self.state_type}, Operation: {self.operation}, Operation node: {self.operation_node}, Parents: {self.parent_link_ids}")
 
     def is_active(self, current_time, decoherence_time):
         return current_time - self.gen_time < decoherence_time
@@ -40,7 +74,20 @@ class EntanglementLinkManager:
         self.subG = nx.MultiGraph()
         self.slot_counter = {}  # {(u,v): count}
 
-    def create_link(self, nodes, gen_time, length_km, p_op, loss_coef=0.2, flag=False, attr=None):
+    def create_link(
+        self,
+        nodes,
+        gen_time,
+        length_km,
+        p_op,
+        loss_coef=0.2,
+        flag=False,
+        attr=None,
+        state_type=None,
+        operation=None,
+        operation_node=None,
+        parent_link_ids=None,
+    ):
         if len(nodes) == 2:
             u, v = nodes
             edge_key = tuple(sorted((u, v)))
@@ -59,7 +106,19 @@ class EntanglementLinkManager:
             edge_key = tuple(sorted(nodes))
             link_id = f"GHZ_{'-'.join(map(str, edge_key))}-t{gen_time}"
 
-        temp_link = EntanglementLink(link_id, nodes, gen_time, length_km, p_op, loss_coef, attr)
+        temp_link = EntanglementLink(
+            link_id,
+            nodes,
+            gen_time,
+            length_km,
+            p_op,
+            loss_coef,
+            attr,
+            state_type=state_type,
+            operation=operation,
+            operation_node=operation_node,
+            parent_link_ids=parent_link_ids,
+        )
 
         # "flag=True" used for test
         if flag:
@@ -123,7 +182,7 @@ class EntanglementLinkManager:
         # plt.show()
 
 
-if __name__ == "__main__":
+def main():
     # A - B - C - D
     edge_list = [
         ("A", "B", 10),
@@ -134,7 +193,49 @@ if __name__ == "__main__":
     topo.show_topology()
 
     manager = EntanglementLinkManager(decoherence_time=6)
-    manager.create_link(["A", "B"], gen_time=0, length_km=topo.get_edge_length("A", "B"), p_op=0.9)
-    manager.create_link(["B", "C"], gen_time=5, length_km=topo.get_edge_length("B", "C"), p_op=0.9)
+    success, bell_id = manager.create_link(
+        ["A", "B"],
+        gen_time=0,
+        length_km=topo.get_edge_length("A", "B"),
+        p_op=1.0,
+        flag=True,
+    )
+    assert success
+    assert manager.links[-1].state_type == "BELL"
+
+    success, swapped_id = manager.create_link(
+        ["A", "C"],
+        gen_time=1,
+        length_km=0,
+        p_op=1.0,
+        flag=True,
+        attr="Swapping",
+        operation_node="B",
+        parent_link_ids=[bell_id],
+    )
+    assert success
+    assert manager.links[-1].state_type == "SWAPPED_BELL"
+    assert manager.links[-1].operation_node == "B"
+    assert manager.links[-1].parent_link_ids == [bell_id]
+
+    success, ghz_id = manager.create_link(
+        ["A", "B", "C"],
+        gen_time=2,
+        length_km=0,
+        p_op=1.0,
+        flag=True,
+        attr="Fusion",
+        state_type="GHZ",
+        operation_node="B",
+        parent_link_ids=[swapped_id],
+    )
+    assert success
+    assert manager.links[-1].state_type == "GHZ"
+    assert ghz_id.startswith("GHZ_")
+
     manager.show_active_links(current_time=4)
-    manager.show_active_links(current_time=8)
+    print("EntanglementLink main test passed.")
+
+
+if __name__ == "__main__":
+    main()

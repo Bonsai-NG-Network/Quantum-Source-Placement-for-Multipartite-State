@@ -18,6 +18,12 @@ from quantum_network import QuantumNetwork
 from entanglement_swapping import EntanglementSwapping
 from entanglement_fusion import EntanglementFusion
 from quantum_source_placement import SourcePlacement
+from steiner_tree_algorithms import approximate_steiner_tree
+from tree_operation_planner import (
+    build_tree_from_paths,
+    build_tree_operation_plan,
+    execute_tree_operation_plan,
+)
 from collections import Counter
 
 
@@ -93,10 +99,19 @@ class SPEntanglementRouting:
     #
     #     return time_slot
 
-    def sp_routing(self, vc, paths, max_timeslot, deployed_sources):
+    def singlepath_star_routing(self, vc, paths, max_timeslot, deployed_sources, q_swap=1.0, q_fus=1.0):
         time_slot = 0
         hasGHZ = False
         num_ghz_in_slot = 0
+        star_tree = build_tree_from_paths(paths)
+        plan = build_tree_operation_plan(
+            star_tree,
+            self.user_set,
+            p_op=self.p_op,
+            q_swap=q_swap,
+            q_fus=q_fus,
+            forced_fusion_nodes=[vc],
+        )
 
         while not hasGHZ:
             time_slot = time_slot + 1
@@ -113,24 +128,71 @@ class SPEntanglementRouting:
             # self.network.show_network_status(current_time=time_slot)
             # self.link_manager.show_active_links(time_slot)
 
-            # Step 2: For users who do not yet share a Bell pair with center, do swapping
-            S_prime = [u for u in self.user_set if u != vc and not self.has_shared_bell_pair(u, vc)]
-            for s in S_prime:
-                path = paths.get(s, [])
-                if path:
-                    self.swapping.entanglement_swapping(path=path, current_time=time_slot, p_op=self.p_op)
+            success = execute_tree_operation_plan(
+                self.swapping,
+                self.fusion,
+                plan,
+                current_time=time_slot,
+                q_swap=q_swap,
+                q_fus=q_fus,
+            )
+            if success:
+                print(f"[Fusion] GHZ generated at vc={vc}, (Packing #{num_ghz_in_slot + 1})")
+                num_ghz_in_slot += 1
+                hasGHZ = True
 
-            # Step 3: If all users now share Bell pairs with center node, do fusion
-            remote_users = [u for u in self.user_set if u != vc]
-            if all(self.has_shared_bell_pair(u, vc) for u in remote_users):
-                success = self.fusion.fuse_users(vc, user_list=self.user_set, current_time=time_slot, p_op=self.p_op)
-                if success:
-                    print(f"[Fusion] GHZ generated at vc={vc}, (Packing #{num_ghz_in_slot + 1})")
-                    num_ghz_in_slot += 1
-                    G_prime = self.link_manager.get_subgraph(current_time=time_slot)
+        return time_slot, num_ghz_in_slot
 
-            # if num_ghz_in_slot > 0:
-            #     hasGHZ = True
+    def sp_routing(self, vc, paths, max_timeslot, deployed_sources):
+        return self.singlepath_star_routing(vc, paths, max_timeslot, deployed_sources)
+
+    def singlepath_tree_routing(
+        self,
+        max_timeslot,
+        deployed_sources,
+        fixed_tree=None,
+        q_swap=1.0,
+        q_fus=1.0,
+    ):
+        if fixed_tree is None:
+            fixed_tree = approximate_steiner_tree(self.network.topo.graph, self.user_set)
+
+        plan = build_tree_operation_plan(
+            fixed_tree,
+            self.user_set,
+            p_op=self.p_op,
+            q_swap=q_swap,
+            q_fus=q_fus,
+        )
+
+        time_slot = 0
+        hasGHZ = False
+        num_ghz_in_slot = 0
+
+        while not hasGHZ:
+            time_slot += 1
+            print("\n")
+            print(f"[SinglePathTree] [Time slot {time_slot}]")
+            if time_slot >= max_timeslot:
+                if num_ghz_in_slot == 0:
+                    time_slot = 0
+                break
+
+            self.network.purge_all_expired(time_slot)
+            self.simulate_entanglement_links(deployed_sources, time_slot)
+
+            success = execute_tree_operation_plan(
+                self.swapping,
+                self.fusion,
+                plan,
+                current_time=time_slot,
+                q_swap=q_swap,
+                q_fus=q_fus,
+            )
+            if success:
+                print(f"[Fusion] GHZ generated via fixed topology Steiner tree.")
+                num_ghz_in_slot += 1
+                hasGHZ = True
 
         return time_slot, num_ghz_in_slot
 
@@ -184,3 +246,75 @@ class SPEntanglementRouting:
 #         print("[FAILURE] Protocol did not succeed within time limit")
 #
 #     net.show_network_status(current_time=final_time)
+
+
+def _deployed_dict_from_edges(edge_list):
+    deployed = {}
+    for u, v, *_ in edge_list:
+        edge = tuple(sorted((u, v)))
+        deployed[edge] = deployed.get(edge, 0) + 1
+    return deployed
+
+
+def main():
+    edge_list = [
+        ("A", "X", 0),
+        ("X", "E", 0),
+        ("E", "B", 0),
+        ("E", "C", 0),
+        ("A", "C", 0),
+    ]
+    users = ["A", "B", "C"]
+    deployed = _deployed_dict_from_edges(edge_list)
+
+    net = QuantumNetwork(edge_list=edge_list, max_per_edge=2, decoherence_time=10)
+    router = SPEntanglementRouting(net, users, p_op=1.0)
+    paths = {
+        "A": ["E", "X", "A"],
+        "B": ["E", "B"],
+        "C": ["E", "C"],
+    }
+    final_time, num_ghz = router.singlepath_star_routing(
+        vc="E",
+        paths=paths,
+        max_timeslot=4,
+        deployed_sources=deployed,
+        q_swap=1.0,
+        q_fus=1.0,
+    )
+    assert final_time > 0
+    assert num_ghz > 0
+
+    net = QuantumNetwork(edge_list=edge_list, max_per_edge=2, decoherence_time=10)
+    router = SPEntanglementRouting(net, users, p_op=1.0)
+    fixed_tree = approximate_steiner_tree(net.topo.graph, users)
+    final_time, num_ghz = router.singlepath_tree_routing(
+        max_timeslot=4,
+        deployed_sources=deployed,
+        fixed_tree=fixed_tree,
+        q_swap=1.0,
+        q_fus=1.0,
+    )
+    assert final_time > 0
+    assert num_ghz > 0
+
+    net = QuantumNetwork(edge_list=edge_list, max_per_edge=2, decoherence_time=10)
+    router = SPEntanglementRouting(net, users, p_op=1.0)
+    final_time, num_ghz = router.singlepath_star_routing(
+        vc="E",
+        paths=paths,
+        max_timeslot=3,
+        deployed_sources=deployed,
+        q_swap=0.0,
+        q_fus=1.0,
+    )
+    ghz_links = [link for link in net.entanglementlink_manager.links if link.state_type == "GHZ"]
+    assert final_time == 0
+    assert num_ghz == 0
+    assert not ghz_links
+
+    print("singlepath_routing main test passed.")
+
+
+if __name__ == "__main__":
+    main()

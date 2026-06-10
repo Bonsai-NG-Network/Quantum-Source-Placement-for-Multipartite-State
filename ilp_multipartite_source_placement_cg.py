@@ -1,0 +1,621 @@
+"""
+Column-generation variant of the ILP source placement model.
+
+This module does not replace ilp_multipartite_source_placement.py. It adds a
+scalable workflow:
+
+    1. Build a small initial candidate-tree set.
+    2. Solve the LP-relaxed restricted master problem (RMP).
+    3. Use dual variables to price new multipartite Steiner-like trees.
+    4. Repeat until no positive reduced-profit tree is found.
+    5. Solve the final integer master problem over generated columns.
+
+The final output is still a source placement. Entanglement routing, swapping,
+and fusion are performed afterwards by the routing simulator.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+
+import networkx as nx
+
+try:
+    import gurobipy as gp
+    from gurobipy import GRB
+except ImportError as exc:
+    raise ImportError(
+        "gurobipy is required for the column generation ILP module."
+    ) from exc
+
+from ilp_multipartite_source_placement import (
+    GUROBI_SEED_MAX,
+    CandidateTree,
+    MultipartiteRequest,
+    build_candidate_trees_for_requests,
+    compute_tree_memory,
+    norm_edge,
+    requests_from_user_sets,
+    solve_joint_source_placement_ilp,
+    status_to_string,
+)
+from network_topology import Topology
+from seed_utils import derive_seed, set_global_seed
+from steiner_tree_algorithms import approximate_steiner_tree
+from tree_operation_planner import build_tree_operation_plan
+
+
+Edge = Tuple[Any, Any]
+
+
+@dataclass
+class RMPResult:
+    status: int
+    status_name: str
+    objective: float
+    request_duals: Dict[int, float]
+    edge_duals: Dict[Edge, float]
+    budget_dual: float
+    memory_duals: Dict[Any, float]
+    model: Any
+
+
+@dataclass
+class PricingResult:
+    request_id: int
+    candidate: Optional[CandidateTree]
+    reduced_profit: float
+    added: bool
+
+
+def tree_signature(tree: nx.Graph) -> frozenset:
+    return frozenset(norm_edge(u, v) for u, v in tree.edges())
+
+
+def next_tree_id(candidate_trees: Dict[int, List[CandidateTree]]) -> int:
+    max_id = -1
+    for trees in candidate_trees.values():
+        for tree in trees:
+            max_id = max(max_id, tree.tree_id)
+    return max_id + 1
+
+
+def candidate_from_tree(
+    graph: nx.Graph,
+    request: MultipartiteRequest,
+    tree: nx.Graph,
+    tree_id: int,
+    p_op: float = 0.8,
+    q_swap: float = 1.0,
+    q_fus: float = 1.0,
+    q_rem: float = 1.0,
+    weight_attr: str = "length_km",
+) -> CandidateTree:
+    rebuilt = nx.Graph()
+    rebuilt.add_nodes_from(tree.nodes(data=True))
+    for u, v in tree.edges():
+        if graph.has_edge(u, v):
+            rebuilt.add_edge(u, v, **graph[u][v])
+        else:
+            rebuilt.add_edge(u, v, **tree[u][v])
+
+    plan = build_tree_operation_plan(
+        rebuilt,
+        users=request.terminals,
+        p_op=p_op,
+        q_swap=q_swap,
+        q_fus=q_fus,
+        q_rem=q_rem,
+        weight_attr=weight_attr,
+    )
+    memory = compute_tree_memory(rebuilt, request.terminals, memory_model="degree")
+
+    return CandidateTree(
+        tree_id=tree_id,
+        request_id=request.request_id,
+        terminals=list(request.terminals),
+        graph=rebuilt,
+        edges=sorted(norm_edge(u, v) for u, v in rebuilt.edges()),
+        swap_nodes=list(plan.swap_nodes),
+        fusion_nodes=list(plan.fusion_nodes),
+        memory=memory,
+        rho=plan.rho,
+        reduced_edges=sorted(norm_edge(u, v) for u, v in plan.reduced_tree.edges()),
+        removal_nodes=list(plan.candidate_removal_nodes),
+    )
+
+
+def build_initial_columns(
+    graph: nx.Graph,
+    requests: List[MultipartiteRequest],
+    k_initial_trees: int = 2,
+    p_op: float = 0.8,
+    q_swap: float = 1.0,
+    q_fus: float = 1.0,
+    q_rem: float = 1.0,
+    seed: Optional[int] = None,
+) -> Dict[int, List[CandidateTree]]:
+    return build_candidate_trees_for_requests(
+        graph=graph,
+        requests=requests,
+        k_trees_per_request=k_initial_trees,
+        p_op=p_op,
+        q_swap=q_swap,
+        q_fus=q_fus,
+        q_rem=q_rem,
+        rho_min=0.0,
+        weight_attr="length_km",
+        seed=seed,
+    )
+
+
+def solve_restricted_master_lp(
+    graph: nx.Graph,
+    requests: List[MultipartiteRequest],
+    candidate_trees: Dict[int, List[CandidateTree]],
+    source_budget: int,
+    max_sources_per_edge: int = 5,
+    node_memory: Optional[Dict[Any, int]] = None,
+    source_cost: int = 1,
+    solver_seed: Optional[int] = None,
+    verbose: bool = False,
+) -> RMPResult:
+    edges = sorted(norm_edge(u, v) for u, v in graph.edges())
+    nodes = sorted(graph.nodes())
+    if node_memory is None:
+        node_memory = {v: 10**6 for v in nodes}
+
+    model = gp.Model("cg_restricted_master_lp")
+    if not verbose:
+        model.Params.OutputFlag = 0
+    if solver_seed is not None:
+        model.Params.Seed = int(solver_seed) % GUROBI_SEED_MAX
+
+    x = {}
+    for req in requests:
+        for tree in candidate_trees.get(req.request_id, []):
+            x[(req.request_id, tree.tree_id)] = model.addVar(
+                lb=0.0,
+                ub=1.0,
+                vtype=GRB.CONTINUOUS,
+                name=f"x_r{req.request_id}_t{tree.tree_id}",
+            )
+    model.update()
+
+    model.setObjective(gp.quicksum(x.values()), GRB.MAXIMIZE)
+
+    request_constraints = {}
+    for req in requests:
+        request_constraints[req.request_id] = model.addConstr(
+            gp.quicksum(
+                x[(req.request_id, tree.tree_id)]
+                for tree in candidate_trees.get(req.request_id, [])
+            )
+            <= 1,
+            name=f"request_r{req.request_id}",
+        )
+
+    edge_constraints = {}
+    for edge in edges:
+        edge_constraints[edge] = model.addConstr(
+            gp.quicksum(
+                x[(req.request_id, tree.tree_id)]
+                for req in requests
+                for tree in candidate_trees.get(req.request_id, [])
+                if edge in tree.edges
+            )
+            <= max_sources_per_edge,
+            name=f"edge_{edge[0]}_{edge[1]}",
+        )
+
+    budget_constraint = model.addConstr(
+        gp.quicksum(
+            source_cost * len(tree.edges) * x[(req.request_id, tree.tree_id)]
+            for req in requests
+            for tree in candidate_trees.get(req.request_id, [])
+        )
+        <= source_budget,
+        name="source_budget",
+    )
+
+    memory_constraints = {}
+    for node in nodes:
+        memory_constraints[node] = model.addConstr(
+            gp.quicksum(
+                tree.memory.get(node, 0) * x[(req.request_id, tree.tree_id)]
+                for req in requests
+                for tree in candidate_trees.get(req.request_id, [])
+            )
+            <= int(node_memory.get(node, 0)),
+            name=f"memory_{node}",
+        )
+
+    model.optimize()
+
+    status = model.Status
+    if status not in [GRB.OPTIMAL, GRB.SUBOPTIMAL]:
+        return RMPResult(
+            status=status,
+            status_name=status_to_string(status),
+            objective=0.0,
+            request_duals={},
+            edge_duals={},
+            budget_dual=0.0,
+            memory_duals={},
+            model=model,
+        )
+
+    return RMPResult(
+        status=status,
+        status_name=status_to_string(status),
+        objective=float(model.ObjVal),
+        request_duals={
+            req_id: float(constr.Pi) for req_id, constr in request_constraints.items()
+        },
+        edge_duals={edge: float(constr.Pi) for edge, constr in edge_constraints.items()},
+        budget_dual=float(budget_constraint.Pi),
+        memory_duals={
+            node: float(constr.Pi) for node, constr in memory_constraints.items()
+        },
+        model=model,
+    )
+
+
+def reduced_profit(
+    tree: CandidateTree,
+    request_dual: float,
+    edge_duals: Dict[Edge, float],
+    budget_dual: float,
+    memory_duals: Dict[Any, float],
+    source_cost: int = 1,
+) -> float:
+    edge_cost = sum(edge_duals.get(edge, 0.0) for edge in tree.edges)
+    budget_cost = budget_dual * source_cost * len(tree.edges)
+    memory_cost = sum(
+        memory_duals.get(node, 0.0) * amount for node, amount in tree.memory.items()
+    )
+    return float(1.0 - request_dual - edge_cost - budget_cost - memory_cost)
+
+
+def build_pricing_graph(
+    graph: nx.Graph,
+    edge_duals: Dict[Edge, float],
+    budget_dual: float,
+    memory_duals: Dict[Any, float],
+    source_cost: int = 1,
+    jitter: float = 0.0,
+    rng_seed: Optional[int] = None,
+) -> nx.Graph:
+    set_global_seed(rng_seed)
+    rng = __import__("random")
+
+    priced = nx.Graph()
+    priced.add_nodes_from(graph.nodes(data=True))
+    for u, v, data in graph.edges(data=True):
+        edge = norm_edge(u, v)
+        weight = (
+            budget_dual * source_cost
+            + edge_duals.get(edge, 0.0)
+            + memory_duals.get(u, 0.0)
+            + memory_duals.get(v, 0.0)
+        )
+        if jitter > 0:
+            weight *= 1.0 + jitter * rng.random()
+        weight = max(float(weight), 1e-9)
+
+        attrs = dict(data)
+        attrs["pricing_weight"] = weight
+        priced.add_edge(u, v, **attrs)
+    return priced
+
+
+def price_request_columns(
+    graph: nx.Graph,
+    request: MultipartiteRequest,
+    rmp_result: RMPResult,
+    existing_signatures: set,
+    start_tree_id: int,
+    source_cost: int = 1,
+    p_op: float = 0.8,
+    q_swap: float = 1.0,
+    q_fus: float = 1.0,
+    q_rem: float = 1.0,
+    pricing_trials: int = 3,
+    reduced_profit_tol: float = 1e-6,
+    seed: Optional[int] = None,
+) -> List[PricingResult]:
+    results: List[PricingResult] = []
+    request_dual = rmp_result.request_duals.get(request.request_id, 0.0)
+    next_id = start_tree_id
+
+    for trial in range(pricing_trials):
+        pricing_graph = build_pricing_graph(
+            graph=graph,
+            edge_duals=rmp_result.edge_duals,
+            budget_dual=rmp_result.budget_dual,
+            memory_duals=rmp_result.memory_duals,
+            source_cost=source_cost,
+            jitter=0.02 if trial > 0 else 0.0,
+            rng_seed=derive_seed(seed, "pricing-graph", request.request_id, trial),
+        )
+
+        try:
+            tree = approximate_steiner_tree(
+                pricing_graph,
+                request.terminals,
+                weight_key="pricing_weight",
+            )
+        except nx.NetworkXException:
+            continue
+
+        signature = tree_signature(tree)
+        if signature in existing_signatures:
+            continue
+
+        candidate = candidate_from_tree(
+            graph=graph,
+            request=request,
+            tree=tree,
+            tree_id=next_id,
+            p_op=p_op,
+            q_swap=q_swap,
+            q_fus=q_fus,
+            q_rem=q_rem,
+        )
+        profit = reduced_profit(
+            candidate,
+            request_dual=request_dual,
+            edge_duals=rmp_result.edge_duals,
+            budget_dual=rmp_result.budget_dual,
+            memory_duals=rmp_result.memory_duals,
+            source_cost=source_cost,
+        )
+        added = profit > reduced_profit_tol
+        results.append(
+            PricingResult(
+                request_id=request.request_id,
+                candidate=candidate if added else None,
+                reduced_profit=profit,
+                added=added,
+            )
+        )
+        if added:
+            existing_signatures.add(signature)
+            next_id += 1
+            break
+
+    return results
+
+
+def column_generation_source_placement(
+    graph: nx.Graph,
+    requests: List[MultipartiteRequest],
+    source_budget: int,
+    max_sources_per_edge: int = 5,
+    node_memory: Optional[Dict[Any, int]] = None,
+    source_cost: int = 1,
+    k_initial_trees: int = 2,
+    pricing_trials: int = 3,
+    max_iterations: int = 20,
+    reduced_profit_tol: float = 1e-6,
+    p_op: float = 0.8,
+    q_swap: float = 1.0,
+    q_fus: float = 1.0,
+    q_rem: float = 1.0,
+    master_seed: Optional[int] = None,
+    final_time_limit: Optional[float] = None,
+    final_mip_gap: Optional[float] = None,
+    verbose: bool = False,
+) -> Dict[str, Any]:
+    set_global_seed(master_seed)
+    initial_seed = derive_seed(master_seed, "cg", "initial-columns")
+    solver_seed = derive_seed(master_seed, "cg", "rmp-solver")
+    final_solver_seed = derive_seed(master_seed, "cg", "final-ilp-solver")
+
+    candidate_trees = build_initial_columns(
+        graph=graph,
+        requests=requests,
+        k_initial_trees=k_initial_trees,
+        p_op=p_op,
+        q_swap=q_swap,
+        q_fus=q_fus,
+        q_rem=q_rem,
+        seed=initial_seed,
+    )
+
+    signatures = {
+        req.request_id: {frozenset(tree.edges) for tree in candidate_trees.get(req.request_id, [])}
+        for req in requests
+    }
+
+    rmp_history = []
+    pricing_history = []
+    total_added = 0
+
+    for iteration in range(max_iterations):
+        rmp_result = solve_restricted_master_lp(
+            graph=graph,
+            requests=requests,
+            candidate_trees=candidate_trees,
+            source_budget=source_budget,
+            max_sources_per_edge=max_sources_per_edge,
+            node_memory=node_memory,
+            source_cost=source_cost,
+            solver_seed=derive_seed(solver_seed, "iteration", iteration),
+            verbose=verbose,
+        )
+        rmp_history.append(
+            {
+                "iteration": iteration,
+                "status": rmp_result.status_name,
+                "objective": rmp_result.objective,
+                "num_columns": sum(len(v) for v in candidate_trees.values()),
+            }
+        )
+
+        if rmp_result.status_name not in {"OPTIMAL", "SUBOPTIMAL"}:
+            break
+
+        added_this_iteration = 0
+        next_id = next_tree_id(candidate_trees)
+        for req in requests:
+            pricing_results = price_request_columns(
+                graph=graph,
+                request=req,
+                rmp_result=rmp_result,
+                existing_signatures=signatures.setdefault(req.request_id, set()),
+                start_tree_id=next_id,
+                source_cost=source_cost,
+                p_op=p_op,
+                q_swap=q_swap,
+                q_fus=q_fus,
+                q_rem=q_rem,
+                pricing_trials=pricing_trials,
+                reduced_profit_tol=reduced_profit_tol,
+                seed=derive_seed(master_seed, "cg", "pricing", iteration),
+            )
+            pricing_history.extend(
+                {
+                    "iteration": iteration,
+                    "request_id": item.request_id,
+                    "reduced_profit": item.reduced_profit,
+                    "added": item.added,
+                }
+                for item in pricing_results
+            )
+
+            for item in pricing_results:
+                if item.added and item.candidate is not None:
+                    candidate_trees.setdefault(req.request_id, []).append(item.candidate)
+                    next_id = max(next_id, item.candidate.tree_id + 1)
+                    added_this_iteration += 1
+                    total_added += 1
+                    break
+
+        if verbose:
+            print(
+                f"[CG] iter={iteration}, RMP={rmp_result.objective:.6f}, "
+                f"added={added_this_iteration}"
+            )
+
+        if added_this_iteration == 0:
+            break
+
+    final_result = solve_joint_source_placement_ilp(
+        graph=graph,
+        requests=requests,
+        candidate_trees=candidate_trees,
+        source_budget=source_budget,
+        max_sources_per_edge=max_sources_per_edge,
+        node_memory=node_memory,
+        source_cost=source_cost,
+        allow_multiple_trees_per_request=False,
+        time_limit=final_time_limit,
+        mip_gap=final_mip_gap,
+        solver_seed=None if final_solver_seed is None else int(final_solver_seed) % GUROBI_SEED_MAX,
+        verbose=verbose,
+    )
+
+    final_result["cg_candidate_trees"] = candidate_trees
+    final_result["cg_iterations"] = len(rmp_history)
+    final_result["cg_added_columns"] = total_added
+    final_result["cg_rmp_history"] = rmp_history
+    final_result["cg_pricing_history"] = pricing_history
+    final_result["cg_initial_seed"] = initial_seed
+    final_result["cg_final_solver_seed"] = final_solver_seed
+    final_result["candidate_tree_counts"] = {
+        req_id: len(trees) for req_id, trees in candidate_trees.items()
+    }
+    return final_result
+
+
+def solve_single_slot_ilp_cg_request_batch(
+    edge_list: List[tuple],
+    request_batch: Iterable[Iterable[Any]],
+    source_budget: int,
+    max_sources_per_edge: int = 5,
+    node_memory: Optional[Dict[Any, int]] = None,
+    node_memory_capacity: Optional[int] = None,
+    k_initial_trees: int = 2,
+    pricing_trials: int = 3,
+    max_iterations: int = 20,
+    p_op: float = 0.8,
+    q_swap: float = 1.0,
+    q_fus: float = 1.0,
+    q_rem: float = 1.0,
+    master_seed: Optional[int] = None,
+    final_time_limit: Optional[float] = None,
+    final_mip_gap: Optional[float] = None,
+    verbose: bool = False,
+) -> Dict[str, Any]:
+    topo = Topology(edge_list)
+    graph = topo.graph
+    requests = requests_from_user_sets(request_batch)
+
+    if node_memory is None and node_memory_capacity is not None:
+        node_memory = {v: int(node_memory_capacity) for v in topo.get_nodes()}
+
+    result = column_generation_source_placement(
+        graph=graph,
+        requests=requests,
+        source_budget=source_budget,
+        max_sources_per_edge=max_sources_per_edge,
+        node_memory=node_memory,
+        source_cost=1,
+        k_initial_trees=k_initial_trees,
+        pricing_trials=pricing_trials,
+        max_iterations=max_iterations,
+        p_op=p_op,
+        q_swap=q_swap,
+        q_fus=q_fus,
+        q_rem=q_rem,
+        master_seed=master_seed,
+        final_time_limit=final_time_limit,
+        final_mip_gap=final_mip_gap,
+        verbose=verbose,
+    )
+
+    result["throughput_qbps"] = result["objective"] or 0.0
+    result["throughput_selected_trees"] = len(result["selected_trees"])
+    result["request_batch"] = [list(req) for req in request_batch]
+    result["master_seed"] = master_seed
+    return result
+
+
+def main() -> None:
+    edge_list = [
+        (0, 1, 0),
+        (1, 2, 0),
+        (0, 3, 0),
+        (3, 4, 0),
+        (2, 4, 0),
+        (1, 3, 0),
+    ]
+    request_batch = [[0, 2, 4], [0, 1, 3]]
+    result = solve_single_slot_ilp_cg_request_batch(
+        edge_list=edge_list,
+        request_batch=request_batch,
+        source_budget=20,
+        max_sources_per_edge=4,
+        k_initial_trees=1,
+        pricing_trials=3,
+        max_iterations=5,
+        p_op=1.0,
+        master_seed=1,
+        final_time_limit=10,
+        final_mip_gap=0.01,
+        verbose=False,
+    )
+    assert result["status_name"] in {"OPTIMAL", "TIME_LIMIT", "SUBOPTIMAL"}
+    assert "routing_source_placement" in result
+    print("Column generation ILP test passed.")
+    print(f"Status: {result['status_name']}")
+    print(f"Objective: {result['objective']}")
+    print(f"CG iterations: {result['cg_iterations']}")
+    print(f"Added columns: {result['cg_added_columns']}")
+    print(f"Routing source placement: {result['routing_source_placement']}")
+
+
+if __name__ == "__main__":
+    main()

@@ -130,7 +130,7 @@ class EventSimulator:
                     return 0.0
         return dr
 
-    def run_single_trial_SP(self, user_set, p_op, edge_probs, deployed_sources):
+    def run_single_trial_singlepath_star(self, user_set, p_op, edge_probs, deployed_sources):
         """
         Run simulation until GHZ is formed for the given user set or until max timeslot.
         Returns number of time slots required or None if failed.
@@ -150,10 +150,21 @@ class EventSimulator:
             print(f"  {vc} -> {s}: {path}")
 
         SProuting = SPEntanglementRouting(self.network, user_set, p_op)
-        time_to_success, num_ghz = SProuting.sp_routing(vc, paths, self.max_timeslot, deployed_sources)
+        time_to_success, num_ghz = SProuting.singlepath_star_routing(vc, paths, self.max_timeslot, deployed_sources)
         return time_to_success, num_ghz
 
-    def run_single_trial_MPG(self, user_set, p_op, edge_probs, deployed_sources):
+    def run_single_trial_SP(self, user_set, p_op, edge_probs, deployed_sources):
+        return self.run_single_trial_singlepath_star(user_set, p_op, edge_probs, deployed_sources)
+
+    def run_single_trial_singlepath_tree(self, user_set, p_op, deployed_sources):
+        SProuting = SPEntanglementRouting(self.network, user_set, p_op)
+        time_to_success, num_ghz = SProuting.singlepath_tree_routing(
+            self.max_timeslot,
+            deployed_sources,
+        )
+        return time_to_success, num_ghz
+
+    def run_single_trial_multipath_star(self, user_set, p_op, edge_probs, deployed_sources):
         G_prime = self.link_manager.get_subgraph(current_time=1)
 
         # vc: The selected center node vc remains fixed
@@ -164,29 +175,33 @@ class EventSimulator:
 
         # paths: the routing solution computed for the selected central node changes with subgraph
         MPGrouting = MPGreedyRouting(self.network, user_set, p_op)
-        time_to_success = MPGrouting.mp_greedy_routing(vc, self.max_timeslot, deployed_sources)
+        time_to_success = MPGrouting.multipath_star_routing(vc, self.max_timeslot, deployed_sources)
+        return time_to_success
+
+    def run_single_trial_MPG(self, user_set, p_op, edge_probs, deployed_sources):
+        return self.run_single_trial_multipath_star(user_set, p_op, edge_probs, deployed_sources)
+
+    def run_single_trial_multipath_tree(self, user_set, p_op, deployed_sources):
+        """
+        Run simulation until GHZ is formed using the multipath-tree protocol.
+        """
+        MPCrouting = MPCooperativeRouting(self.network, user_set, p_op)
+        time_to_success = MPCrouting.multipath_tree_routing(self.max_timeslot, deployed_sources)
         return time_to_success
 
     def run_single_trial_MPC(self, user_set, p_op, deployed_sources):
+        return self.run_single_trial_multipath_tree(user_set, p_op, deployed_sources)
+
+    def run_single_trial_multipath_tree_packing(self, user_set, p_op, deployed_sources):
         """
-        Run simulation until GHZ is formed for the given user set or until max timeslot
-        using the MP-C protocol.
+        Run simulation until GHZ is formed using multipath-tree-packing.
         """
-        # Unlike SP/MPG, MPC does not require a pre-selected center node.
-        # Source placement is still based on the Steiner tree heuristic.
-        MPCrouting = MPCooperativeRouting(self.network, user_set, p_op)
-        time_to_success = MPCrouting.mpc_routing(self.max_timeslot, deployed_sources)
-        return time_to_success
+        MPProuting = MPPackingRouting(self.network, user_set, p_op)
+        time_to_success, num_ghz = MPProuting.multipath_tree_packing_routing(self.max_timeslot, deployed_sources)
+        return time_to_success, num_ghz
 
     def run_single_trial_MPP(self, user_set, p_op, deployed_sources):
-        """
-        Run simulation until GHZ is formed for the given user set or until max timeslot
-        using the MP-P protocol.
-        """
-        # MPP also does not require a pre-selected center node.
-        MPProuting = MPPackingRouting(self.network, user_set, p_op)
-        time_to_success, num_ghz = MPProuting.mpp_routing(self.max_timeslot, deployed_sources)
-        return time_to_success, num_ghz
+        return self.run_single_trial_multipath_tree_packing(user_set, p_op, deployed_sources)
 
     def run_trials(self, seed, user_sets, routing_method, source_method, dr_object, cost_budget):
         if seed is not None:
@@ -260,14 +275,17 @@ class EventSimulator:
 
             num_ghz = 1  # Default for SP, MPG, MPC
 
-            if routing_method == 'PR':
-                time_to_success, num_ghz = self.run_single_trial_SP(user_set, self.p_op, edge_probs, deployed_dict)
-            elif routing_method == 'MPG':
-                time_to_success = self.run_single_trial_MPG(user_set, self.p_op, edge_probs, deployed_dict)
-            elif routing_method == 'MPC':
-                time_to_success = self.run_single_trial_MPC(user_set, self.p_op, deployed_dict)
-            elif routing_method == 'RR':
-                time_to_success, num_ghz = self.run_single_trial_MPP(user_set, self.p_op, deployed_dict)
+            method_key = routing_method.lower()
+            if method_key in {'pr', 'singlepath_star'}:
+                time_to_success, num_ghz = self.run_single_trial_singlepath_star(user_set, self.p_op, edge_probs, deployed_dict)
+            elif method_key in {'singlepath_tree'}:
+                time_to_success, num_ghz = self.run_single_trial_singlepath_tree(user_set, self.p_op, deployed_dict)
+            elif method_key in {'mpg', 'multipath_star'}:
+                time_to_success = self.run_single_trial_multipath_star(user_set, self.p_op, edge_probs, deployed_dict)
+            elif method_key in {'mpc', 'multipath_tree'}:
+                time_to_success = self.run_single_trial_multipath_tree(user_set, self.p_op, deployed_dict)
+            elif method_key in {'rr', 'mpp', 'multipath_tree_packing'}:
+                time_to_success, num_ghz = self.run_single_trial_multipath_tree_packing(user_set, self.p_op, deployed_dict)
             else:
                 raise ValueError(f"Unknown routing_method: {routing_method}")
 

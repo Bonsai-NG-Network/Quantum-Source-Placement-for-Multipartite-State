@@ -21,7 +21,19 @@ class QuantumNetwork:
             self.nodes[u].add_channel(u, v, length_km)
             self.nodes[v].add_channel(v, u, length_km)
 
-    def attempt_entanglement(self, node1, node2, p_op, gen_time, attr=None, flag=False):
+    def attempt_entanglement(
+        self,
+        node1,
+        node2,
+        p_op,
+        gen_time,
+        attr=None,
+        flag=False,
+        state_type=None,
+        operation=None,
+        operation_node=None,
+        parent_link_ids=None,
+    ):
         if attr is None:
             length_km = self.topo.get_edge_length(node1, node2)
         else:
@@ -29,12 +41,37 @@ class QuantumNetwork:
             length_km = 0
             p_op = 1
 
-        success, link_id = self.entanglementlink_manager.create_link([node1, node2], p_op=p_op, gen_time=gen_time, length_km=length_km, attr=attr, flag=flag)
+        success, link_id = self.entanglementlink_manager.create_link(
+            [node1, node2],
+            p_op=p_op,
+            gen_time=gen_time,
+            length_km=length_km,
+            attr=attr,
+            flag=flag,
+            state_type=state_type,
+            operation=operation,
+            operation_node=operation_node,
+            parent_link_ids=parent_link_ids,
+        )
 
         if success and self.nodes[node1].node_record_entanglement(peer_id=node2, link_id=link_id, gen_time_slot=gen_time) \
            and self.nodes[node2].node_record_entanglement(peer_id=node1, link_id=link_id, gen_time_slot=gen_time):
             return True, link_id
         return False, None
+
+    def release_link_memory_everywhere(self, link_id):
+        released = 0
+        for node in self.nodes.values():
+            released += node.memory.release_by_link_id(link_id)
+        return released
+
+    def record_ghz_memory(self, user_list, ghz_link_id, gen_time, fidelity=1.0):
+        for user in user_list:
+            if user not in self.nodes:
+                return False
+            if not self.nodes[user].memory.occupy_ghz_memory(ghz_link_id, gen_time, fidelity):
+                return False
+        return True
 
     def show_network_status(self, current_time):  # update the memory and the entanglement link
         print("\n")
@@ -57,17 +94,27 @@ class QuantumNetwork:
         self.entanglementlink_manager.slot_counter = {}
 #
 #
-# if __name__ == "__main__":
-#     # A - B - C - D
-#     edge_list = [
-#         ("A", "B", 10),
-#         ("B", "C", 15),
-#         ("C", "D", 20)
-#     ]
-#
-#     net = QuantumNetwork(edge_list=edge_list, max_per_edge=4, decoherence_time=6)
-#     # net = QuantumNetwork(length_network=3, width_network=3, edge_length_km=1, max_per_edge=4, decoherence_time=6)
-#     net.attempt_entanglement("A", "B", p_op=0.9, gen_time=0)
-#     net.attempt_entanglement("B", "C", p_op=0.9, gen_time=4)
-#     net.show_network_status(current_time=5)
-#     net.show_network_status(current_time=9)
+def main():
+    edge_list = [
+        ("A", "B", 10),
+        ("B", "C", 15),
+        ("C", "D", 20),
+    ]
+
+    net = QuantumNetwork(edge_list=edge_list, max_per_edge=4, decoherence_time=6)
+    success, link_id = net.attempt_entanglement("A", "B", p_op=1.0, gen_time=0, flag=True)
+    assert success
+    assert link_id in [item[0] for item in net.nodes["A"].memory.memory_storage["B"]]
+    assert net.release_link_memory_everywhere(link_id) == 2
+    assert "B" not in net.nodes["A"].memory.memory_storage
+    assert "A" not in net.nodes["B"].memory.memory_storage
+
+    assert net.record_ghz_memory(["A", "B", "C"], "ghz-1", gen_time=1)
+    assert net.nodes["A"].get_memory_usage() == 1
+    assert net.nodes["B"].get_memory_usage() == 1
+    assert net.nodes["C"].get_memory_usage() == 1
+    print("QuantumNetwork main test passed.")
+
+
+if __name__ == "__main__":
+    main()

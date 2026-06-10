@@ -49,6 +49,39 @@ class QuantumMemory:
         self.memory_storage[peer_id].append((link_id, gen_time, fidelity))
         return True
 
+    @staticmethod
+    def ghz_memory_key(ghz_link_id):
+        return ("GHZ", ghz_link_id)
+
+    def occupy_ghz_memory(self, ghz_link_id, gen_time, fidelity=1.0):
+        return self.occupy_memory(
+            peer_id=self.ghz_memory_key(ghz_link_id),
+            link_id=ghz_link_id,
+            gen_time=gen_time,
+            fidelity=fidelity,
+        )
+
+    def release_by_link_id(self, link_id, peer_id=None):
+        peer_ids = [peer_id] if peer_id is not None else list(self.memory_storage.keys())
+        released = 0
+
+        for key in peer_ids:
+            if key not in self.memory_storage:
+                continue
+
+            before = len(self.memory_storage[key])
+            self.memory_storage[key] = [
+                (stored_link_id, gen_time, fidelity)
+                for stored_link_id, gen_time, fidelity in self.memory_storage[key]
+                if stored_link_id != link_id
+            ]
+            released += before - len(self.memory_storage[key])
+
+            if not self.memory_storage[key]:
+                del self.memory_storage[key]
+
+        return released
+
     def release_memory(self, current_time):
         for peer_id in list(self.memory_storage.keys()):
             # Filter out expired links for each peer
@@ -76,5 +109,27 @@ class QuantumMemory:
             return math.exp(-self.decay_rate * dt)
         elif self.fidelity_decay == 'linear':
             return max(0.0, 1.0 - self.decay_rate * dt)
+
+
+def main():
+    memory = QuantumMemory(node_id="A", max_per_edge=2, decoherence_time=10)
+
+    assert memory.occupy_memory("B", "bell-1", gen_time=0)
+    assert memory.occupy_memory("B", "bell-2", gen_time=0)
+    assert not memory.occupy_memory("B", "bell-3", gen_time=0)
+    assert memory.release_by_link_id("bell-1", peer_id="B") == 1
+    assert len(memory.memory_storage["B"]) == 1
+
+    assert memory.occupy_ghz_memory("ghz-1", gen_time=1)
+    ghz_key = QuantumMemory.ghz_memory_key("ghz-1")
+    assert ghz_key in memory.memory_storage
+    assert memory.release_by_link_id("ghz-1") == 1
+    assert ghz_key not in memory.memory_storage
+
+    print("QuantumMemory main test passed.")
+
+
+if __name__ == "__main__":
+    main()
 
 
