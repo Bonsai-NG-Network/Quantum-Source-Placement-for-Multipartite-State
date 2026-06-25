@@ -26,9 +26,18 @@ import math
 
 
 class QuantumMemory:
-    def __init__(self, node_id, max_per_edge=1, decoherence_time=10, fidelity_decay=None, decay_rate=0.01, ):
+    def __init__(
+        self,
+        node_id,
+        max_per_edge=1,
+        decoherence_time=10,
+        fidelity_decay=None,
+        decay_rate=0.01,
+        max_total=None,
+    ):
         self.node_id = node_id
         self.max_per_edge = max_per_edge
+        self.max_total = max_total
         self.decoherence_time = decoherence_time
         self.fidelity_decay = fidelity_decay
         self.decay_rate = decay_rate
@@ -36,10 +45,16 @@ class QuantumMemory:
         # Structure: {peer_id: [(link_id, gen_time), ...]}
         self.memory_storage = {}
 
+    def get_total_usage(self):
+        return sum(len(links) for links in self.memory_storage.values())
+
     def occupy_memory(self, peer_id, link_id, gen_time, fidelity=1.0):
         # Ensure the peer has an entry in memory_storage
         if peer_id not in self.memory_storage:
             self.memory_storage[peer_id] = []
+
+        if self.max_total is not None and self.get_total_usage() >= self.max_total:
+            return False
 
         # Check if the memory for this specific edge is full
         if len(self.memory_storage[peer_id]) >= self.max_per_edge:
@@ -96,7 +111,10 @@ class QuantumMemory:
 
     def show_memory(self, current_time):
         self.release_memory(current_time)
-        print(f"  Memory (Max per edge: {self.max_per_edge}) Content at [time slot {current_time}]")
+        print(
+            f"  Memory (Max per edge: {self.max_per_edge}, "
+            f"Max total: {self.max_total}) Content at [time slot {current_time}]"
+        )
         for peer_id, links in self.memory_storage.items():
             for link_id, gen_time, fidelity in links:
                 print(f"    Peer_id: {peer_id}, Link_id: {link_id}, Gen_time: {gen_time}, Fidelity: {fidelity:.2f}")

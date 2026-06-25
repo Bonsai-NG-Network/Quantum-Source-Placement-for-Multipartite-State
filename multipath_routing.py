@@ -2,7 +2,6 @@ import networkx as nx
 from quantum_network import QuantumNetwork
 from entanglement_swapping import EntanglementSwapping
 from entanglement_fusion import EntanglementFusion
-from quantum_source_placement import SourcePlacement
 from steiner_tree_algorithms import approximate_steiner_tree, has_connecting_tree
 from tree_operation_planner import (
     build_tree_from_paths,
@@ -13,7 +12,7 @@ from collections import Counter
 import matplotlib.pyplot as plt
 
 
-class MPGreedyRouting:
+class MultipathStarRouting:
     def __init__(self, network, user_set, p_op, q_swap=1.0, q_fus=1.0):
         self.p_op = p_op
         self.q_swap = q_swap
@@ -68,7 +67,7 @@ class MPGreedyRouting:
 
         while not hasGHZ:
             time_slot = time_slot + 1
-            print(f"\n[MultiplePathGreedy] [Time slot {time_slot}]")
+            print(f"\n[MultipathStar] [Time slot {time_slot}]")
             if time_slot >= max_timeslot:
                 time_slot = 0
                 break
@@ -112,7 +111,7 @@ class MPGreedyRouting:
         return self.multipath_star_routing(vc, max_timeslot, deployed_sources)
 
 
-class MPCooperativeRouting:
+class MultipathTreeRouting:
     def __init__(self, network, user_set, p_op, q_swap=1.0, q_fus=1.0):
         self.p_op = p_op
         self.q_swap = q_swap
@@ -152,7 +151,7 @@ class MPCooperativeRouting:
 
         while not hasGHZ:
             time_slot += 1
-            print(f"\n[MultiplePathCooperative] [Time slot {time_slot}]")
+            print(f"\n[MultipathTree] [Time slot {time_slot}]")
             if time_slot > max_timeslot:
                 time_slot = 0
                 break
@@ -194,7 +193,7 @@ class MPCooperativeRouting:
         return self.multipath_tree_routing(max_timeslot, deployed_sources)
 
 
-class MPPackingRouting:
+class MultipathTreePackingRouting:
     def __init__(self, network, user_set, p_op, q_swap=1.0, q_fus=1.0):
         self.p_op = p_op
         self.q_swap = q_swap
@@ -235,7 +234,7 @@ class MPPackingRouting:
 
         while not hasGHZ:
             time_slot += 1
-            print(f"\n[MultiplePathPacking] [Time slot {time_slot}]")
+            print(f"\n[MultipathTreePacking] [Time slot {time_slot}]")
             if time_slot > max_timeslot:
                 time_slot = 0
                 break
@@ -326,14 +325,14 @@ class MPPackingRouting:
 #
 #     net = QuantumNetwork(edge_list=edge_list, memory_size=4, decoherence_time=6)
 #
-#     source = SourcePlacement(net.topo)
+#     source = AllEdgesRoundRobinSourcePlacement(net.topo)
 #     sources = source.place_sources_for_request(users)
 #     for u, v in sources:
 #         net.attempt_entanglement(u, v, p_op=0.9, gen_time=0, flag=True)
 #
 #     net.show_network_status(current_time=0)
 #
-#     MPGrouting = MPGreedyRouting(net, users, p_op=0.9)
+#     MPGrouting = MultipathStarRouting(net, users, p_op=0.9)
 #     print("\n[MultiPath_G+ Routing Test]")
 #     final_time, cost = MPGrouting.mp_greedy_routing(vc, max_timeslot)
 #     if final_time:
@@ -361,7 +360,7 @@ def main():
     for u, v, _ in edge_list:
         tree.add_edge(u, v, length_km=10)
 
-    router = MPPackingRouting(network, user_set, p_op=1.0, q_swap=1.0, q_fus=1.0)
+    router = MultipathTreePackingRouting(network, user_set, p_op=1.0, q_swap=1.0, q_fus=1.0)
     plan = build_tree_operation_plan(tree, user_set, p_op=1.0, q_swap=1.0, q_fus=1.0)
     assert plan.swap_nodes == ["X"]
     assert plan.candidate_removal_nodes == ["E"]
@@ -386,7 +385,7 @@ def main():
     network = QuantumNetwork(edge_list=edge_list, max_per_edge=2, decoherence_time=10)
     for u, v, _ in edge_list:
         network.attempt_entanglement(u, v, p_op=1.0, gen_time=0, flag=True)
-    router = MPPackingRouting(network, user_set, p_op=1.0, q_swap=0.0, q_fus=1.0)
+    router = MultipathTreePackingRouting(network, user_set, p_op=1.0, q_swap=0.0, q_fus=1.0)
     plan = build_tree_operation_plan(tree, user_set, p_op=1.0, q_swap=0.0, q_fus=1.0)
     assert not execute_tree_operation_plan(
         router.swapping,
@@ -401,7 +400,7 @@ def main():
 
     network = QuantumNetwork(edge_list=edge_list, max_per_edge=2, decoherence_time=10)
     deployed = {tuple(sorted((u, v))): 1 for u, v, _ in edge_list}
-    router = MPPackingRouting(network, user_set, p_op=1.0, q_swap=1.0, q_fus=1.0)
+    router = MultipathTreePackingRouting(network, user_set, p_op=1.0, q_swap=1.0, q_fus=1.0)
     final_time, num_ghz = router.multipath_tree_packing_routing(max_timeslot=4, deployed_sources=deployed)
     assert final_time > 0
     assert num_ghz > 0

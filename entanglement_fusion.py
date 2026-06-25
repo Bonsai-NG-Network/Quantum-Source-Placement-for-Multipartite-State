@@ -78,6 +78,7 @@ class EntanglementFusion:
             return False
 
         if not self.network.record_ghz_memory(user_list, ghz_link_id, current_time):
+            self.link_manager.remove_link_by_id(ghz_link_id)
             return False
 
         for node in candidate_removal_nodes:

@@ -29,10 +29,14 @@ from ilp_multipartite_source_placement import (
     GUROBI_SEED_MAX,
     CandidateTree,
     MultipartiteRequest,
+    allocate_redundant_source_placement,
+    build_batch_user_path_edges,
     build_candidate_trees_for_requests,
     norm_edge,
     requests_from_user_sets,
+    served_request_priority,
     status_to_string,
+    tree_objective_value,
 )
 from network_topology import Topology
 from seed_utils import derive_seed, set_global_seed
@@ -58,6 +62,7 @@ def solve_source_placement_lp_relaxation(
     max_sources_per_edge: int = 5,
     node_memory: Optional[Dict[Any, int]] = None,
     source_cost: int = 1,
+    max_trees_per_request: int = 1,
     solver_seed: Optional[int] = None,
     verbose: bool = False,
 ) -> LPRelaxationResult:
@@ -73,8 +78,17 @@ def solve_source_placement_lp_relaxation(
     if solver_seed is not None:
         model.Params.Seed = int(solver_seed) % GUROBI_SEED_MAX
 
+    max_trees_per_request = max(1, int(max_trees_per_request))
+
     x = {}
+    y = {}
     for req in requests:
+        y[req.request_id] = model.addVar(
+            lb=0.0,
+            ub=1.0,
+            vtype=GRB.CONTINUOUS,
+            name=f"y_r{req.request_id}",
+        )
         for tree in candidate_trees.get(req.request_id, []):
             x[(req.request_id, tree.tree_id)] = model.addVar(
                 lb=0.0,
@@ -84,16 +98,32 @@ def solve_source_placement_lp_relaxation(
             )
 
     model.update()
-    model.setObjective(gp.quicksum(x.values()), GRB.MAXIMIZE)
+    request_priority = served_request_priority(candidate_trees)
+    model.setObjective(
+        gp.quicksum(
+            request_priority * y[req.request_id]
+            for req in requests
+        )
+        + gp.quicksum(
+            tree_objective_value(tree) * x[(req.request_id, tree.tree_id)]
+            for req in requests
+            for tree in candidate_trees.get(req.request_id, [])
+        ),
+        GRB.MAXIMIZE,
+    )
 
     for req in requests:
+        selected_for_request = gp.quicksum(
+            x[(req.request_id, tree.tree_id)]
+            for tree in candidate_trees.get(req.request_id, [])
+        )
         model.addConstr(
-            gp.quicksum(
-                x[(req.request_id, tree.tree_id)]
-                for tree in candidate_trees.get(req.request_id, [])
-            )
-            <= 1,
-            name=f"request_r{req.request_id}",
+            selected_for_request >= y[req.request_id],
+            name=f"request_coverage_lower_r{req.request_id}",
+        )
+        model.addConstr(
+            selected_for_request <= max_trees_per_request * y[req.request_id],
+            name=f"request_tree_limit_r{req.request_id}",
         )
 
     for edge in edges:
@@ -157,6 +187,8 @@ def round_lp_solution_to_source_placement(
     max_sources_per_edge: int = 5,
     node_memory: Optional[Dict[Any, int]] = None,
     source_cost: int = 1,
+    max_trees_per_request: int = 1,
+    fallback_edges: Optional[Iterable[Edge]] = None,
     epsilon: float = 1e-9,
 ) -> Dict[str, Any]:
     if node_memory is None:
@@ -178,7 +210,7 @@ def round_lp_solution_to_source_placement(
 
     candidate_items.sort(
         key=lambda item: (
-            -item[2],
+            -(item[2] * tree_objective_value(item[1])),
             len(item[1].edges),
             -item[1].rho,
             item[0].request_id,
@@ -186,36 +218,42 @@ def round_lp_solution_to_source_placement(
         )
     )
 
-    selected_requests = set()
+    max_trees_per_request = max(1, int(max_trees_per_request))
+    selected_tree_keys = set()
     selected_trees = []
     served_requests = set()
+    selected_count_by_request: Dict[int, int] = {}
     edge_load: Dict[Edge, int] = {}
     memory_load: Dict[Any, int] = {}
     used_budget = 0
 
-    for req, tree, value in candidate_items:
-        if req.request_id in selected_requests:
-            continue
-
+    def try_select(req: MultipartiteRequest, tree: CandidateTree, value: float) -> bool:
+        nonlocal used_budget
+        tree_key = (req.request_id, tree.tree_id)
+        if tree_key in selected_tree_keys:
+            return False
+        if selected_count_by_request.get(req.request_id, 0) >= max_trees_per_request:
+            return False
         tree_budget = source_cost * len(tree.edges)
         if used_budget + tree_budget > source_budget:
-            continue
+            return False
 
         violates_edge = any(
             edge_load.get(edge, 0) + 1 > max_sources_per_edge
             for edge in tree.edges
         )
         if violates_edge:
-            continue
+            return False
 
         violates_memory = any(
             memory_load.get(node, 0) + amount > int(node_memory.get(node, 0))
             for node, amount in tree.memory.items()
         )
         if violates_memory:
-            continue
+            return False
 
-        selected_requests.add(req.request_id)
+        selected_tree_keys.add(tree_key)
+        selected_count_by_request[req.request_id] = selected_count_by_request.get(req.request_id, 0) + 1
         served_requests.add(req.request_id)
         used_budget += tree_budget
 
@@ -237,14 +275,40 @@ def round_lp_solution_to_source_placement(
                 "lp_value": value,
             }
         )
+        return True
+
+    for req in requests:
+        for item_req, tree, value in candidate_items:
+            if item_req.request_id == req.request_id and try_select(item_req, tree, value):
+                break
+
+    for req, tree, value in candidate_items:
+        try_select(req, tree, value)
+
+    redundant = allocate_redundant_source_placement(
+        selected_trees=selected_trees,
+        source_budget=source_budget,
+        max_sources_per_edge=max_sources_per_edge,
+        node_memory=node_memory,
+        source_cost=source_cost,
+        candidate_trees=candidate_trees,
+        fallback_edges=fallback_edges,
+        enforce_node_memory_for_redundancy=True,
+    )
 
     return {
-        "routing_source_placement": dict(sorted(edge_load.items())),
-        "source_placement": dict(sorted(edge_load.items())),
+        "routing_source_placement": redundant["routing_source_placement"],
+        "minimum_routing_source_placement": dict(sorted(edge_load.items())),
+        "source_placement": redundant["routing_source_placement"],
         "selected_trees": selected_trees,
         "served_requests": sorted(served_requests),
-        "used_budget": used_budget,
-        "memory_load": memory_load,
+        "minimum_used_budget": used_budget,
+        "used_budget": redundant["used_budget"],
+        "memory_load": redundant["memory_load"],
+        "minimum_memory_load": memory_load,
+        "redundant_enforce_node_memory": True,
+        "candidate_edge_count": redundant["candidate_edge_count"],
+        "effective_capacity": redundant["effective_capacity"],
     }
 
 
@@ -299,6 +363,7 @@ def solve_single_slot_lp_rounding_request_batch(
         max_sources_per_edge=max_sources_per_edge,
         node_memory=node_memory,
         source_cost=1,
+        max_trees_per_request=max(1, int(k_trees_per_request)),
         solver_seed=lp_solver_seed,
         verbose=verbose,
     )
@@ -311,6 +376,8 @@ def solve_single_slot_lp_rounding_request_batch(
         max_sources_per_edge=max_sources_per_edge,
         node_memory=node_memory,
         source_cost=1,
+        max_trees_per_request=max(1, int(k_trees_per_request)),
+        fallback_edges=build_batch_user_path_edges(graph, requests),
     )
 
     result = {
@@ -325,8 +392,11 @@ def solve_single_slot_lp_rounding_request_batch(
         "served_requests": rounded["served_requests"],
         "used_budget": rounded["used_budget"],
         "memory_load": rounded["memory_load"],
-        "throughput_qbps": len(rounded["selected_trees"]),
+        "candidate_edge_count": rounded["candidate_edge_count"],
+        "effective_capacity": rounded["effective_capacity"],
+        "throughput_qbps": len(rounded["served_requests"]),
         "throughput_selected_trees": len(rounded["selected_trees"]),
+        "throughput_covered_requests": len(rounded["served_requests"]),
         "request_batch": [list(req) for req in request_batch],
         "master_seed": master_seed,
         "candidate_seed": candidate_seed,
@@ -339,6 +409,8 @@ def solve_single_slot_lp_rounding_request_batch(
 
 
 def main() -> None:
+    import single_slot_throughput_sweep_conditions as conditions
+
     edge_list = [
         (0, 1, 0),
         (1, 2, 0),
@@ -355,7 +427,7 @@ def main() -> None:
         max_sources_per_edge=4,
         k_trees_per_request=4,
         p_op=1.0,
-        master_seed=1,
+        master_seed=conditions.RANDOM_SEED,
         verbose=False,
     )
     assert result["status_name"] in {"OPTIMAL", "SUBOPTIMAL"}

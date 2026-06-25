@@ -5,10 +5,9 @@ Source placement via:
 3) Multiple-Choice (Grouped) DP to select how many pairs per edge under a budget
 """
 
-import random
 import networkx as nx
 from collections import defaultdict
-from steiner_tree_algorithms import approximate_steiner_tree, gen_multi_steiner_trees
+from steiner_tree_algorithms import gen_multi_steiner_trees
 
 PAIR_COST = 1
 
@@ -59,48 +58,17 @@ class SourcePlacementDP:
 
     def _generate_diverse_steiner_trees(self, user_set, K=5, lambda_overlap=0.8, weight_attr='length_km'):
         """
-        Generate K 'diverse' Steiner trees by inflating the weight of edges
-        that were already used in previous trees (overlap penalty).
-        Also add a tiny random jitter to diversify.
+        Generate K diverse Steiner trees via the shared repository generator.
+
+        lambda_overlap and weight_attr are kept for API compatibility with
+        older callers; the shared generator uses length_km internally.
 
         Returns:
             trees: list of sets of undirected edge keys (u,v) per Steiner tree
         """
-        G = self.topo.graph.copy()
-        # ensure each edge has a base weight
-        for u, v in G.edges():
-            if weight_attr not in G[u][v]:
-                # fallback on existing length/weight, else unit
-                L = G[u][v].get('length_km', G[u][v].get('weight', 1.0))
-                G[u][v][weight_attr] = float(L)
-
-        used_count = defaultdict(int)
         trees = []
-        for k in range(K):
-            # build modified weights with overlap penalty + tiny jitter
-            for u, v in G.edges():
-                base_w = float(G[u][v][weight_attr])
-                pen = 1.0 + lambda_overlap * used_count[_normalize_edge_tuple((u, v))]
-                jitter = 1.0 + 0.02 * random.random()  # small randomness
-                G[u][v]['_tmp_w'] = base_w * pen * jitter
-
-            T = approximate_steiner_tree(G, user_set)  # NOTE: your function should accept weight param if needed
-            # If your approximate_steiner_tree accepts weight kw, pass weight='_tmp_w'.
-            # e.g., T = approximate_steiner_tree(G, user_set, weight='_tmp_w')
-
-            # Collect undirected edges from T
-            tree_edges = set()
-            for (u, v) in T.edges():
-                tree_edges.add(_normalize_edge_tuple((u, v)))
-                used_count[_normalize_edge_tuple((u, v))] += 1
-
-            trees.append(tree_edges)
-
-            # clean temp weights if needed
-            for u, v in G.edges():
-                if '_tmp_w' in G[u][v]:
-                    del G[u][v]['_tmp_w']
-
+        for T in gen_multi_steiner_trees(self.topo.graph, user_set, k_trees=K):
+            trees.append({_normalize_edge_tuple(edge) for edge in T.edges()})
         return trees
 
     def _userpair_k_shortest_paths(self, user_set, k_paths=2, weight_attr='length_km'):

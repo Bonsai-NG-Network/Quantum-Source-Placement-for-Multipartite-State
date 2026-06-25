@@ -40,9 +40,14 @@ class QuantumChannel:
 
 
 class QuantumNode:
-    def __init__(self, node_id, max_per_edge=1, decoherence_time=10):
+    def __init__(self, node_id, max_per_edge=1, decoherence_time=10, max_total_memory=None):
         self.node_id = node_id
-        self.memory = QuantumMemory(node_id=node_id, max_per_edge=max_per_edge, decoherence_time=decoherence_time)
+        self.memory = QuantumMemory(
+            node_id=node_id,
+            max_per_edge=max_per_edge,
+            decoherence_time=decoherence_time,
+            max_total=max_total_memory,
+        )
         self.channels = {}  # key: (node_id, peer_id), value: QuantumChannel
 
     def add_channel(self, node_id, peer_id, length_km):
@@ -59,10 +64,7 @@ class QuantumNode:
         self.memory.release_memory(current_time)
 
     def get_memory_usage(self):
-        total_usage = 0
-        for links in self.memory.memory_storage.values():
-            total_usage += len(links)
-        return total_usage
+        return self.memory.get_total_usage()
 
     # show the memory and the connected channel of the node
     def show_node_status(self, current_time):

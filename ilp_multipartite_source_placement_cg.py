@@ -39,6 +39,7 @@ from ilp_multipartite_source_placement import (
     requests_from_user_sets,
     solve_joint_source_placement_ilp,
     status_to_string,
+    tree_objective_value,
 )
 from network_topology import Topology
 from seed_utils import derive_seed, set_global_seed
@@ -158,6 +159,7 @@ def solve_restricted_master_lp(
     max_sources_per_edge: int = 5,
     node_memory: Optional[Dict[Any, int]] = None,
     source_cost: int = 1,
+    max_trees_per_request: int = 1,
     solver_seed: Optional[int] = None,
     verbose: bool = False,
 ) -> RMPResult:
@@ -165,6 +167,7 @@ def solve_restricted_master_lp(
     nodes = sorted(graph.nodes())
     if node_memory is None:
         node_memory = {v: 10**6 for v in nodes}
+    max_trees_per_request = max(1, int(max_trees_per_request))
 
     model = gp.Model("cg_restricted_master_lp")
     if not verbose:
@@ -183,7 +186,14 @@ def solve_restricted_master_lp(
             )
     model.update()
 
-    model.setObjective(gp.quicksum(x.values()), GRB.MAXIMIZE)
+    model.setObjective(
+        gp.quicksum(
+            tree_objective_value(tree) * x[(req.request_id, tree.tree_id)]
+            for req in requests
+            for tree in candidate_trees.get(req.request_id, [])
+        ),
+        GRB.MAXIMIZE,
+    )
 
     request_constraints = {}
     for req in requests:
@@ -192,7 +202,7 @@ def solve_restricted_master_lp(
                 x[(req.request_id, tree.tree_id)]
                 for tree in candidate_trees.get(req.request_id, [])
             )
-            <= 1,
+            <= max_trees_per_request,
             name=f"request_r{req.request_id}",
         )
 
@@ -275,7 +285,7 @@ def reduced_profit(
     memory_cost = sum(
         memory_duals.get(node, 0.0) * amount for node, amount in tree.memory.items()
     )
-    return float(1.0 - request_dual - edge_cost - budget_cost - memory_cost)
+    return float(tree_objective_value(tree) - request_dual - edge_cost - budget_cost - memory_cost)
 
 
 def build_pricing_graph(
@@ -322,12 +332,15 @@ def price_request_columns(
     q_fus: float = 1.0,
     q_rem: float = 1.0,
     pricing_trials: int = 3,
+    max_columns_to_add: int = 1,
     reduced_profit_tol: float = 1e-6,
     seed: Optional[int] = None,
 ) -> List[PricingResult]:
     results: List[PricingResult] = []
     request_dual = rmp_result.request_duals.get(request.request_id, 0.0)
     next_id = start_tree_id
+    added_count = 0
+    max_columns_to_add = max(1, int(max_columns_to_add))
 
     for trial in range(pricing_trials):
         pricing_graph = build_pricing_graph(
@@ -383,7 +396,9 @@ def price_request_columns(
         if added:
             existing_signatures.add(signature)
             next_id += 1
-            break
+            added_count += 1
+            if added_count >= max_columns_to_add:
+                break
 
     return results
 
@@ -397,6 +412,8 @@ def column_generation_source_placement(
     source_cost: int = 1,
     k_initial_trees: int = 2,
     pricing_trials: int = 3,
+    max_trees_per_request: Optional[int] = None,
+    max_pricing_columns_per_request: int = 3,
     max_iterations: int = 20,
     reduced_profit_tol: float = 1e-6,
     p_op: float = 0.8,
@@ -412,6 +429,10 @@ def column_generation_source_placement(
     initial_seed = derive_seed(master_seed, "cg", "initial-columns")
     solver_seed = derive_seed(master_seed, "cg", "rmp-solver")
     final_solver_seed = derive_seed(master_seed, "cg", "final-ilp-solver")
+    if max_trees_per_request is None:
+        max_trees_per_request = max(1, int(k_initial_trees) + int(pricing_trials))
+    else:
+        max_trees_per_request = max(1, int(max_trees_per_request))
 
     candidate_trees = build_initial_columns(
         graph=graph,
@@ -442,6 +463,7 @@ def column_generation_source_placement(
             max_sources_per_edge=max_sources_per_edge,
             node_memory=node_memory,
             source_cost=source_cost,
+            max_trees_per_request=max_trees_per_request,
             solver_seed=derive_seed(solver_seed, "iteration", iteration),
             verbose=verbose,
         )
@@ -472,6 +494,7 @@ def column_generation_source_placement(
                 q_fus=q_fus,
                 q_rem=q_rem,
                 pricing_trials=pricing_trials,
+                max_columns_to_add=max_pricing_columns_per_request,
                 reduced_profit_tol=reduced_profit_tol,
                 seed=derive_seed(master_seed, "cg", "pricing", iteration),
             )
@@ -491,7 +514,6 @@ def column_generation_source_placement(
                     next_id = max(next_id, item.candidate.tree_id + 1)
                     added_this_iteration += 1
                     total_added += 1
-                    break
 
         if verbose:
             print(
@@ -510,7 +532,8 @@ def column_generation_source_placement(
         max_sources_per_edge=max_sources_per_edge,
         node_memory=node_memory,
         source_cost=source_cost,
-        allow_multiple_trees_per_request=False,
+        allow_multiple_trees_per_request=True,
+        demand_per_request=max_trees_per_request,
         time_limit=final_time_limit,
         mip_gap=final_mip_gap,
         solver_seed=None if final_solver_seed is None else int(final_solver_seed) % GUROBI_SEED_MAX,
@@ -524,6 +547,8 @@ def column_generation_source_placement(
     final_result["cg_pricing_history"] = pricing_history
     final_result["cg_initial_seed"] = initial_seed
     final_result["cg_final_solver_seed"] = final_solver_seed
+    final_result["cg_max_trees_per_request"] = max_trees_per_request
+    final_result["cg_max_pricing_columns_per_request"] = max_pricing_columns_per_request
     final_result["candidate_tree_counts"] = {
         req_id: len(trees) for req_id, trees in candidate_trees.items()
     }
@@ -539,6 +564,8 @@ def solve_single_slot_ilp_cg_request_batch(
     node_memory_capacity: Optional[int] = None,
     k_initial_trees: int = 2,
     pricing_trials: int = 3,
+    max_trees_per_request: Optional[int] = None,
+    max_pricing_columns_per_request: int = 3,
     max_iterations: int = 20,
     p_op: float = 0.8,
     q_swap: float = 1.0,
@@ -556,6 +583,67 @@ def solve_single_slot_ilp_cg_request_batch(
     if node_memory is None and node_memory_capacity is not None:
         node_memory = {v: int(node_memory_capacity) for v in topo.get_nodes()}
 
+    use_nested_pool = False
+    try:
+        import single_slot_throughput_sweep_conditions as conditions
+
+        use_nested_pool = bool(getattr(conditions, "ILP_CG_USE_NESTED_POOL", False))
+    except (ImportError, AttributeError):
+        use_nested_pool = False
+
+    if use_nested_pool:
+        nested_max_trees = max(1, int(max_trees_per_request or k_initial_trees))
+        candidate_seed = derive_seed(master_seed, "ilp", "candidate-trees")
+        solver_seed = derive_seed(master_seed, "cg", "nested-final-ilp-solver")
+        candidate_trees = build_candidate_trees_for_requests(
+            graph=graph,
+            requests=requests,
+            k_trees_per_request=nested_max_trees,
+            p_op=p_op,
+            q_swap=q_swap,
+            q_fus=q_fus,
+            q_rem=q_rem,
+            rho_min=0.0,
+            weight_attr="length_km",
+            seed=candidate_seed,
+        )
+
+        result = solve_joint_source_placement_ilp(
+            graph=graph,
+            requests=requests,
+            candidate_trees=candidate_trees,
+            source_budget=source_budget,
+            max_sources_per_edge=max_sources_per_edge,
+            node_memory=node_memory,
+            source_cost=1,
+            allow_multiple_trees_per_request=True,
+            demand_per_request=nested_max_trees,
+            time_limit=final_time_limit,
+            mip_gap=final_mip_gap,
+            solver_seed=None if solver_seed is None else int(solver_seed) % GUROBI_SEED_MAX,
+            verbose=verbose,
+        )
+        result["cg_candidate_trees"] = candidate_trees
+        result["cg_iterations"] = 0
+        result["cg_added_columns"] = 0
+        result["cg_rmp_history"] = []
+        result["cg_pricing_history"] = []
+        result["cg_initial_seed"] = candidate_seed
+        result["cg_final_solver_seed"] = solver_seed
+        result["cg_max_trees_per_request"] = nested_max_trees
+        result["cg_max_pricing_columns_per_request"] = 0
+        result["cg_nested_pool"] = True
+        result["candidate_tree_counts"] = {
+            req_id: len(trees) for req_id, trees in candidate_trees.items()
+        }
+        result["throughput_selected_trees"] = len(result["selected_trees"])
+        result["throughput_covered_requests"] = len(result.get("covered_requests", result["served_requests"]))
+        result["throughput_qbps"] = result["throughput_covered_requests"]
+        result["throughput_expected_objective"] = result["objective"] or 0.0
+        result["request_batch"] = [list(req) for req in request_batch]
+        result["master_seed"] = master_seed
+        return result
+
     result = column_generation_source_placement(
         graph=graph,
         requests=requests,
@@ -565,6 +653,8 @@ def solve_single_slot_ilp_cg_request_batch(
         source_cost=1,
         k_initial_trees=k_initial_trees,
         pricing_trials=pricing_trials,
+        max_trees_per_request=max_trees_per_request,
+        max_pricing_columns_per_request=max_pricing_columns_per_request,
         max_iterations=max_iterations,
         p_op=p_op,
         q_swap=q_swap,
@@ -576,14 +666,18 @@ def solve_single_slot_ilp_cg_request_batch(
         verbose=verbose,
     )
 
-    result["throughput_qbps"] = result["objective"] or 0.0
     result["throughput_selected_trees"] = len(result["selected_trees"])
+    result["throughput_covered_requests"] = len(result.get("covered_requests", result["served_requests"]))
+    result["throughput_qbps"] = result["throughput_covered_requests"]
+    result["throughput_expected_objective"] = result["objective"] or 0.0
     result["request_batch"] = [list(req) for req in request_batch]
     result["master_seed"] = master_seed
     return result
 
 
 def main() -> None:
+    import single_slot_throughput_sweep_conditions as conditions
+
     edge_list = [
         (0, 1, 0),
         (1, 2, 0),
@@ -602,7 +696,7 @@ def main() -> None:
         pricing_trials=3,
         max_iterations=5,
         p_op=1.0,
-        master_seed=1,
+        master_seed=conditions.RANDOM_SEED,
         final_time_limit=10,
         final_mip_gap=0.01,
         verbose=False,

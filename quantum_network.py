@@ -4,7 +4,7 @@ from entanglement_link import EntanglementLinkManager
 
 
 class QuantumNetwork:
-    def __init__(self, edge_list, max_per_edge=1, decoherence_time=10):
+    def __init__(self, edge_list, max_per_edge=1, decoherence_time=10, node_memory_capacity=None):
     # def __init__(self, length_network, width_network, edge_length_km, max_per_edge=1, decoherence_time=10):
         self.topo = Topology(edge_list)
         # self.topo = Topology(length_network, width_network, edge_length_km)
@@ -12,9 +12,15 @@ class QuantumNetwork:
         self.nodes = {}
         self.entanglementlink_manager = EntanglementLinkManager(decoherence_time)
         self.max_per_edge = max_per_edge
+        self.node_memory_capacity = node_memory_capacity
 
         for node_id in self.topo.get_nodes():
-            self.nodes[node_id] = QuantumNode(node_id, max_per_edge, decoherence_time)
+            self.nodes[node_id] = QuantumNode(
+                node_id,
+                max_per_edge,
+                decoherence_time,
+                max_total_memory=node_memory_capacity,
+            )
 
         for u, v in self.topo.get_edges():
             length_km = self.topo.get_edge_length(u, v)
@@ -54,9 +60,24 @@ class QuantumNetwork:
             parent_link_ids=parent_link_ids,
         )
 
-        if success and self.nodes[node1].node_record_entanglement(peer_id=node2, link_id=link_id, gen_time_slot=gen_time) \
-           and self.nodes[node2].node_record_entanglement(peer_id=node1, link_id=link_id, gen_time_slot=gen_time):
-            return True, link_id
+        if success:
+            node1_recorded = self.nodes[node1].node_record_entanglement(
+                peer_id=node2,
+                link_id=link_id,
+                gen_time_slot=gen_time,
+            )
+            node2_recorded = False
+            if node1_recorded:
+                node2_recorded = self.nodes[node2].node_record_entanglement(
+                    peer_id=node1,
+                    link_id=link_id,
+                    gen_time_slot=gen_time,
+                )
+            if node1_recorded and node2_recorded:
+                return True, link_id
+
+            self.release_link_memory_everywhere(link_id)
+            self.entanglementlink_manager.remove_link_by_id(link_id)
         return False, None
 
     def release_link_memory_everywhere(self, link_id):
@@ -66,11 +87,17 @@ class QuantumNetwork:
         return released
 
     def record_ghz_memory(self, user_list, ghz_link_id, gen_time, fidelity=1.0):
+        recorded_users = []
         for user in user_list:
             if user not in self.nodes:
+                for recorded_user in recorded_users:
+                    self.nodes[recorded_user].memory.release_by_link_id(ghz_link_id)
                 return False
             if not self.nodes[user].memory.occupy_ghz_memory(ghz_link_id, gen_time, fidelity):
+                for recorded_user in recorded_users:
+                    self.nodes[recorded_user].memory.release_by_link_id(ghz_link_id)
                 return False
+            recorded_users.append(user)
         return True
 
     def show_network_status(self, current_time):  # update the memory and the entanglement link

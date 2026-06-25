@@ -3,26 +3,43 @@ import networkx as nx
 from network_request import RequestGenerator
 from quantum_network import QuantumNetwork
 from singlepath_routing import SPEntanglementRouting
-from multipath_routing import MPGreedyRouting, MPCooperativeRouting, MPPackingRouting
+from multipath_routing import MultipathStarRouting, MultipathTreeRouting, MultipathTreePackingRouting
 from entanglement_swapping import EntanglementSwapping
 from entanglement_fusion import EntanglementFusion
 from entanglement_distribution import EntanglementDistribution
-from quantum_source_placement import SourcePlacement
+from quantum_source_placement_all_edges_rr import AllEdgesRoundRobinSourcePlacement
 from quantum_source_placement_dp import SourcePlacementDP
 from quantum_source_placement_backup import SourcePlacementBackup
 from entanglement_link import EntanglementLink
 from collections import Counter
+from seed_utils import derive_seed, set_global_seed
+import single_slot_throughput_sweep_conditions as conditions
 
 
 class EventSimulator:
-    def __init__(self, edge_list, max_per_edge, p_op, decoherence_time, num_users=3, max_timeslot=500):
+    def __init__(
+        self,
+        edge_list,
+        max_per_edge,
+        p_op,
+        decoherence_time,
+        num_users=3,
+        max_timeslot=500,
+        node_memory_capacity=None,
+        q_swap=1.0,
+        q_fus=1.0,
+    ):
     # def __init__(self, length_network, width_network, edge_length_km, max_per_edge, p_op, decoherence_time, num_users=3, max_timeslot=500):
         self.p_op = p_op
         self.num_users = num_users
         self.max_timeslot = max_timeslot
         self.max_per_edge = max_per_edge
+        self.node_memory_capacity = node_memory_capacity
+        self.q_swap = q_swap
+        self.q_fus = q_fus
         self.network = QuantumNetwork(edge_list=edge_list, max_per_edge=self.max_per_edge,
-                                      decoherence_time=decoherence_time)
+                                      decoherence_time=decoherence_time,
+                                      node_memory_capacity=node_memory_capacity)
         # self.network = QuantumNetwork(length_network=length_network, width_network=width_network,
         #                               edge_length_km=edge_length_km,
         #                               max_per_edge=self.max_per_edge, decoherence_time=decoherence_time)
@@ -150,7 +167,14 @@ class EventSimulator:
             print(f"  {vc} -> {s}: {path}")
 
         SProuting = SPEntanglementRouting(self.network, user_set, p_op)
-        time_to_success, num_ghz = SProuting.singlepath_star_routing(vc, paths, self.max_timeslot, deployed_sources)
+        time_to_success, num_ghz = SProuting.singlepath_star_routing(
+            vc,
+            paths,
+            self.max_timeslot,
+            deployed_sources,
+            q_swap=self.q_swap,
+            q_fus=self.q_fus,
+        )
         return time_to_success, num_ghz
 
     def run_single_trial_SP(self, user_set, p_op, edge_probs, deployed_sources):
@@ -161,6 +185,8 @@ class EventSimulator:
         time_to_success, num_ghz = SProuting.singlepath_tree_routing(
             self.max_timeslot,
             deployed_sources,
+            q_swap=self.q_swap,
+            q_fus=self.q_fus,
         )
         return time_to_success, num_ghz
 
@@ -174,7 +200,7 @@ class EventSimulator:
             return 0
 
         # paths: the routing solution computed for the selected central node changes with subgraph
-        MPGrouting = MPGreedyRouting(self.network, user_set, p_op)
+        MPGrouting = MultipathStarRouting(self.network, user_set, p_op, q_swap=self.q_swap, q_fus=self.q_fus)
         time_to_success = MPGrouting.multipath_star_routing(vc, self.max_timeslot, deployed_sources)
         return time_to_success
 
@@ -185,7 +211,7 @@ class EventSimulator:
         """
         Run simulation until GHZ is formed using the multipath-tree protocol.
         """
-        MPCrouting = MPCooperativeRouting(self.network, user_set, p_op)
+        MPCrouting = MultipathTreeRouting(self.network, user_set, p_op, q_swap=self.q_swap, q_fus=self.q_fus)
         time_to_success = MPCrouting.multipath_tree_routing(self.max_timeslot, deployed_sources)
         return time_to_success
 
@@ -196,7 +222,7 @@ class EventSimulator:
         """
         Run simulation until GHZ is formed using multipath-tree-packing.
         """
-        MPProuting = MPPackingRouting(self.network, user_set, p_op)
+        MPProuting = MultipathTreePackingRouting(self.network, user_set, p_op, q_swap=self.q_swap, q_fus=self.q_fus)
         time_to_success, num_ghz = MPProuting.multipath_tree_packing_routing(self.max_timeslot, deployed_sources)
         return time_to_success, num_ghz
 
@@ -204,8 +230,7 @@ class EventSimulator:
         return self.run_single_trial_multipath_tree_packing(user_set, p_op, deployed_sources)
 
     def run_trials(self, seed, user_sets, routing_method, source_method, dr_object, cost_budget):
-        if seed is not None:
-            random.seed(seed)
+        set_global_seed(seed)
 
         all_deployed_dicts = []
 
@@ -217,7 +242,7 @@ class EventSimulator:
 
             self.network.reset()
             if source_method == "NOP":
-                source = SourcePlacement(self.topo)
+                source = AllEdgesRoundRobinSourcePlacement(self.topo)
                 sources = source.place_sources_for_request(user_set, method=source_method, cost_budget=cost_budget,
                                                            max_per_edge=self.max_per_edge)
                 cost = source.compute_cost()
@@ -245,7 +270,7 @@ class EventSimulator:
                     k_trees=3,
                     p_op=self.p_op,
                     loss_coef_dB_per_km=0.2,
-                    seed=2,
+                    seed=derive_seed(seed, "op-bp", trial_num),
                 )
                 cost = sp_backup.compute_cost()
             else:
@@ -258,7 +283,7 @@ class EventSimulator:
 
             edge_probs = {}   # used for choosing the center node
             for (u, v) in sources:
-                length_km = self.topo.graph[u][v].get("length", 1)
+                length_km = self.topo.graph[u][v].get("length_km", 1)
                 temp_link = EntanglementLink(
                     link_id=f"{u}-{v}",
                     nodes=[u, v],
@@ -327,7 +352,7 @@ if __name__ == "__main__":
     WIDTH_NETWORK = 3
     EDGE_LENGTH_KM = 1
 
-    RANDOM_SEED = 1
+    RANDOM_SEED = conditions.RANDOM_SEED
     NUM_TRIALS = 100
     P_OP = 0.9
     NUM_USERS = 3
@@ -352,7 +377,7 @@ if __name__ == "__main__":
     dr_mpp = EntanglementDistribution()
 
     print(f"Generating {NUM_TRIALS} user sets for the experiment...")
-    random.seed(RANDOM_SEED)
+    set_global_seed(RANDOM_SEED)
     user_sets_list = [simulator.user_gen.random_users(k=NUM_USERS) for _ in range(NUM_TRIALS)]
     # user_sets_list = [[(0, 0), (0, 4), (4, 0), (4, 4)]]
 

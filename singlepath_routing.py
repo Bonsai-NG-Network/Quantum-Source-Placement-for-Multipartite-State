@@ -17,7 +17,6 @@ Core steps:
 from quantum_network import QuantumNetwork
 from entanglement_swapping import EntanglementSwapping
 from entanglement_fusion import EntanglementFusion
-from quantum_source_placement import SourcePlacement
 from steiner_tree_algorithms import approximate_steiner_tree
 from tree_operation_planner import (
     build_tree_from_paths,
@@ -230,7 +229,7 @@ class SPEntanglementRouting:
 #     net = QuantumNetwork(edge_list=edge_list, memory_size=4, decoherence_time=6)
 #     # net = QuantumNetwork(length_network=3, width_network=3, edge_length_km=3, max_per_edge=4, decoherence_time=6)
 #
-#     source = SourcePlacement(net.topo)
+#     source = AllEdgesRoundRobinSourcePlacement(net.topo)
 #     sources = source.place_sources_for_request(users)
 #     for u, v in sources:
 #         net.attempt_entanglement(u, v, p_op=0.9, gen_time=0)

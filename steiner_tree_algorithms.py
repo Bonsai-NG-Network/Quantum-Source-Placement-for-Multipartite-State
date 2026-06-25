@@ -82,14 +82,13 @@ def gen_multi_steiner_trees(G_orig, user_set, k_trees=5):
         for u, v, data in G_orig.edges(data=True):
             base = float(data.get("length_km", data.get("weight", 1.0)))
             jitter = 1.0 + 0.02 * random.random()
-            # 抖动直接写回 'length'（算法实际使用的权重键）
+            # 抖动直接写回 length_km（算法实际使用的权重键）
             G.add_edge(
                 u, v,
-                length=base * jitter,
-                length_km=data.get("length_km", base),  # 备查属性，可留可不留
+                length_km=base * jitter,
             )
         try:
-            T = approximate_steiner_tree(G, user_set, weight_key='length')
+            T = approximate_steiner_tree(G, user_set, weight_key='length_km')
             if T.number_of_edges() > 0:
                 # 复制一份，避免后续外部修改
                 H = nx.Graph()
@@ -157,6 +156,6 @@ if __name__ == "__main__":
 
     print(f"\n生成了 {len(trees)} 棵不同的候选 Steiner 树")
     for i, T in enumerate(trees, 1):
-        total_len = sum(T[u][v]['length'] for u, v in T.edges())
+        total_len = sum(T[u][v]['length_km'] for u, v in T.edges())
         print(f"Tree {i}: 节点数={T.number_of_nodes()}, 边数={T.number_of_edges()}, 总长度={total_len:.2f}")
         print(T.edges)

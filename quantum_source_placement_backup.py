@@ -3,6 +3,8 @@ import random
 import networkx as nx
 from collections import Counter, defaultdict
 from steiner_tree_algorithms import approximate_steiner_tree, gen_multi_steiner_trees
+from seed_utils import derive_seed, set_global_seed
+import single_slot_throughput_sweep_conditions as conditions
 
 PAIR_COST = 1
 
@@ -30,9 +32,9 @@ class SourcePlacementBackup:
         k_trees=5,
         p_op=1.0,
         loss_coef_dB_per_km=0.2,
-        seed=1
+        seed=None
     ):
-        random.seed(seed)
+        set_global_seed(seed)
 
         if method in ("OP", "steiner_tree"):
             return self._baseline_round_robin(user_set, base="steiner",
@@ -394,7 +396,7 @@ if __name__ == "__main__":
         k_trees=3,
         p_op=0.9,
         loss_coef_dB_per_km=0.2,
-        seed=2
+        seed=derive_seed(conditions.RANDOM_SEED, "quantum-source-placement-backup", "demo")
     )
     print("Placed pairs:", placed)
 
