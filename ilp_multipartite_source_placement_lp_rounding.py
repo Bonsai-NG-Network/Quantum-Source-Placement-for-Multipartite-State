@@ -32,11 +32,12 @@ from ilp_multipartite_source_placement import (
     allocate_redundant_source_placement,
     build_batch_user_path_edges,
     build_candidate_trees_for_requests,
+    ilp_objective_mode,
     norm_edge,
     requests_from_user_sets,
     served_request_priority,
     status_to_string,
-    tree_objective_value,
+    tree_expected_throughput_value,
 )
 from network_topology import Topology
 from seed_utils import derive_seed, set_global_seed
@@ -50,7 +51,10 @@ class LPRelaxationResult:
     status: int
     status_name: str
     objective: float
+    expected_throughput_term: float
+    objective_mode: str
     x_values: Dict[Tuple[int, int], float]
+    z_values: Dict[Edge, float]
     model: Any
 
 
@@ -82,6 +86,15 @@ def solve_source_placement_lp_relaxation(
 
     x = {}
     y = {}
+    z = {
+        edge: model.addVar(
+            lb=0.0,
+            ub=max_sources_per_edge,
+            vtype=GRB.CONTINUOUS,
+            name=f"z_{edge[0]}_{edge[1]}",
+        )
+        for edge in edges
+    }
     for req in requests:
         y[req.request_id] = model.addVar(
             lb=0.0,
@@ -98,17 +111,35 @@ def solve_source_placement_lp_relaxation(
             )
 
     model.update()
-    request_priority = served_request_priority(candidate_trees)
-    model.setObjective(
-        gp.quicksum(
+    objective_mode = ilp_objective_mode()
+    if objective_mode not in {
+        "expected_throughput",
+        "coverage_expected_throughput",
+        "coverage_expected_throughput_with_redundancy",
+    }:
+        raise ValueError(f"Unsupported ILP objective_mode={objective_mode!r}.")
+
+    coverage_terms = []
+    if objective_mode in {
+        "coverage_expected_throughput",
+        "coverage_expected_throughput_with_redundancy",
+    }:
+        request_priority = served_request_priority(candidate_trees)
+        coverage_terms = [
             request_priority * y[req.request_id]
             for req in requests
-        )
-        + gp.quicksum(
-            tree_objective_value(tree) * x[(req.request_id, tree.tree_id)]
-            for req in requests
-            for tree in candidate_trees.get(req.request_id, [])
-        ),
+        ]
+
+    # LP-rounding uses the same expected-throughput surrogate as the full ILP,
+    # with x and y relaxed to continuous variables. The ILP probabilities are
+    # expected values; realized throughput is sampled later by the simulator.
+    expected_terms = [
+        tree_expected_throughput_value(req, tree) * x[(req.request_id, tree.tree_id)]
+        for req in requests
+        for tree in candidate_trees.get(req.request_id, [])
+    ]
+    model.setObjective(
+        gp.quicksum(coverage_terms + expected_terms),
         GRB.MAXIMIZE,
     )
 
@@ -127,22 +158,25 @@ def solve_source_placement_lp_relaxation(
         )
 
     for edge in edges:
+        selected_edge_load = gp.quicksum(
+            x[(req.request_id, tree.tree_id)]
+            for req in requests
+            for tree in candidate_trees.get(req.request_id, [])
+            if edge in tree.edges
+        )
         model.addConstr(
-            gp.quicksum(
-                x[(req.request_id, tree.tree_id)]
-                for req in requests
-                for tree in candidate_trees.get(req.request_id, [])
-                if edge in tree.edges
-            )
-            <= max_sources_per_edge,
+            selected_edge_load <= z[edge],
             name=f"edge_{edge[0]}_{edge[1]}",
+        )
+        model.addConstr(
+            z[edge] <= selected_edge_load,
+            name=f"edge_source_exact_without_redundancy_{edge[0]}_{edge[1]}",
         )
 
     model.addConstr(
         gp.quicksum(
-            source_cost * len(tree.edges) * x[(req.request_id, tree.tree_id)]
-            for req in requests
-            for tree in candidate_trees.get(req.request_id, [])
+            source_cost * z[edge]
+            for edge in edges
         )
         <= source_budget,
         name="source_budget",
@@ -158,6 +192,15 @@ def solve_source_placement_lp_relaxation(
             <= int(node_memory.get(node, 0)),
             name=f"memory_{node}",
         )
+        model.addConstr(
+            gp.quicksum(
+                z[edge]
+                for edge in edges
+                if node in edge
+            )
+            <= int(node_memory.get(node, 0)),
+            name=f"memory_source_placement_{node}",
+        )
 
     model.optimize()
     status = model.Status
@@ -166,15 +209,27 @@ def solve_source_placement_lp_relaxation(
             status=status,
             status_name=status_to_string(status),
             objective=0.0,
+            expected_throughput_term=0.0,
+            objective_mode=objective_mode,
             x_values={},
+            z_values={},
             model=model,
         )
 
+    expected_throughput_term = sum(
+        tree_expected_throughput_value(req, tree)
+        * float(x[(req.request_id, tree.tree_id)].X)
+        for req in requests
+        for tree in candidate_trees.get(req.request_id, [])
+    )
     return LPRelaxationResult(
         status=status,
         status_name=status_to_string(status),
         objective=float(model.ObjVal),
+        expected_throughput_term=float(expected_throughput_term),
+        objective_mode=objective_mode,
         x_values={key: float(var.X) for key, var in x.items()},
+        z_values={edge: float(var.X) for edge, var in z.items()},
         model=model,
     )
 
@@ -210,7 +265,7 @@ def round_lp_solution_to_source_placement(
 
     candidate_items.sort(
         key=lambda item: (
-            -(item[2] * tree_objective_value(item[1])),
+            -(item[2] * tree_expected_throughput_value(item[0], item[1])),
             len(item[1].edges),
             -item[1].rho,
             item[0].request_id,
@@ -225,6 +280,7 @@ def round_lp_solution_to_source_placement(
     selected_count_by_request: Dict[int, int] = {}
     edge_load: Dict[Edge, int] = {}
     memory_load: Dict[Any, int] = {}
+    source_memory_load: Dict[Any, int] = {}
     used_budget = 0
 
     def try_select(req: MultipartiteRequest, tree: CandidateTree, value: float) -> bool:
@@ -252,6 +308,18 @@ def round_lp_solution_to_source_placement(
         if violates_memory:
             return False
 
+        tree_source_memory: Dict[Any, int] = {}
+        for edge in tree.edges:
+            u, v = edge
+            tree_source_memory[u] = tree_source_memory.get(u, 0) + 1
+            tree_source_memory[v] = tree_source_memory.get(v, 0) + 1
+        violates_source_memory = any(
+            source_memory_load.get(node, 0) + amount > int(node_memory.get(node, 0))
+            for node, amount in tree_source_memory.items()
+        )
+        if violates_source_memory:
+            return False
+
         selected_tree_keys.add(tree_key)
         selected_count_by_request[req.request_id] = selected_count_by_request.get(req.request_id, 0) + 1
         served_requests.add(req.request_id)
@@ -259,6 +327,8 @@ def round_lp_solution_to_source_placement(
 
         for edge in tree.edges:
             edge_load[edge] = edge_load.get(edge, 0) + 1
+        for node, amount in tree_source_memory.items():
+            source_memory_load[node] = source_memory_load.get(node, 0) + amount
         for node, amount in tree.memory.items():
             memory_load[node] = memory_load.get(node, 0) + amount
 
@@ -306,6 +376,7 @@ def round_lp_solution_to_source_placement(
         "used_budget": redundant["used_budget"],
         "memory_load": redundant["memory_load"],
         "minimum_memory_load": memory_load,
+        "minimum_source_memory_load": source_memory_load,
         "redundant_enforce_node_memory": True,
         "candidate_edge_count": redundant["candidate_edge_count"],
         "effective_capacity": redundant["effective_capacity"],
@@ -337,7 +408,9 @@ def solve_single_slot_lp_rounding_request_batch(
     if node_memory is None and node_memory_capacity is not None:
         node_memory = {v: int(node_memory_capacity) for v in topo.get_nodes()}
 
-    candidate_seed = derive_seed(master_seed, "lp-round", "candidate-trees")
+    # LP-R is the relaxation/rounding baseline for the same candidate pool used
+    # by the full ILP.
+    candidate_seed = derive_seed(master_seed, "ilp", "candidate-trees")
     lp_solver_seed = solver_seed
     if lp_solver_seed is None:
         lp_solver_seed = derive_seed(master_seed, "lp-round", "solver")
@@ -385,6 +458,12 @@ def solve_single_slot_lp_rounding_request_batch(
         "status_name": lp_result.status_name,
         "objective": lp_result.objective,
         "lp_objective": lp_result.objective,
+        "ilp_expected_objective": lp_result.objective,
+        "ilp_expected_throughput_term": lp_result.expected_throughput_term,
+        "ilp_covered_requests": len(rounded["served_requests"]),
+        "ilp_selected_tree_count": len(rounded["selected_trees"]),
+        "deployed_source_count": sum(rounded["source_placement"].values()),
+        "objective_mode": lp_result.objective_mode,
         "x_values": lp_result.x_values,
         "source_placement": rounded["source_placement"],
         "routing_source_placement": rounded["routing_source_placement"],
@@ -435,7 +514,7 @@ def main() -> None:
     assert result["throughput_selected_trees"] >= 1
     print("LP relaxation + rounding test passed.")
     print(f"Status: {result['status_name']}")
-    print(f"LP objective: {result['lp_objective']}")
+    print(f"LP expected objective: {result['lp_objective']}")
     print(f"Selected trees: {result['throughput_selected_trees']}")
     print(f"Routing source placement: {result['routing_source_placement']}")
 

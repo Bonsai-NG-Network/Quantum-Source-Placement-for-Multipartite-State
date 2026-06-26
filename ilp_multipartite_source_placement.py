@@ -99,21 +99,77 @@ class CandidateTree:
 
 def tree_objective_value(tree: CandidateTree) -> float:
     """
-    Secondary reward for selecting one candidate tree.
+    Expected-throughput utility for selecting one candidate tree.
 
-    The main ILP objective gives first priority to covering distinct requests.
-    This term is then used to choose redundant trees and prefer higher-quality
-    candidate trees.
+    Candidate trees are source-placement guides. The ILP uses the same
+    physical probabilities as the stochastic simulator, but only as expected
+    values. The simulator later samples actual link generation, swapping, and
+    fusion outcomes.
     """
-    return 1.0 + float(tree.rho)
+    return float(tree.rho)
 
 
-def served_request_priority(candidate_trees: Dict[int, List[CandidateTree]]) -> float:
-    """Return the fixed lexicographic weight for serving one additional request."""
+def request_priority_weight(request: MultipartiteRequest) -> float:
+    """Return the expected-throughput priority weight for one request."""
+    return float(getattr(request, "weight", 1.0) or 1.0)
+
+
+def tree_expected_throughput_value(
+    request: MultipartiteRequest,
+    tree: CandidateTree,
+) -> float:
+    """Return w_r * rho_{r,t} for the ILP expected-throughput term."""
+    return request_priority_weight(request) * tree_objective_value(tree)
+
+
+def ilp_objective_mode() -> str:
+    """Return the configured source-placement expected objective mode."""
     try:
         import single_slot_throughput_sweep_conditions as conditions
 
-        return float(conditions.ILP_REQUEST_PRIORITY)
+        return str(
+            getattr(
+                conditions,
+                "ILP_OBJECTIVE_MODE",
+                getattr(conditions, "objective_mode", "coverage_expected_throughput"),
+            )
+        )
+    except (ImportError, AttributeError):
+        return "coverage_expected_throughput"
+
+
+def use_redundancy_reward_by_default() -> bool:
+    """Return whether the z_e diminishing-return reward is enabled."""
+    try:
+        import single_slot_throughput_sweep_conditions as conditions
+
+        return bool(getattr(conditions, "ILP_USE_REDUNDANCY_REWARD", False))
+    except (ImportError, AttributeError):
+        return False
+
+
+def spend_remaining_budget_after_solve_by_default() -> bool:
+    """Return whether to deploy unused budget after the clean ILP solve."""
+    try:
+        import single_slot_throughput_sweep_conditions as conditions
+
+        return bool(getattr(conditions, "ILP_SPEND_REMAINING_BUDGET_AFTER_SOLVE", True))
+    except (ImportError, AttributeError):
+        return True
+
+
+def served_request_priority(candidate_trees: Dict[int, List[CandidateTree]]) -> float:
+    """Return the coverage-first weight M for one additional covered request."""
+    try:
+        import single_slot_throughput_sweep_conditions as conditions
+
+        return float(
+            getattr(
+                conditions,
+                "ILP_COVERAGE_PRIORITY_WEIGHT",
+                getattr(conditions, "ILP_REQUEST_PRIORITY", 1000.0),
+            )
+        )
     except (ImportError, AttributeError):
         return 1000.0
 
@@ -532,9 +588,9 @@ def build_edge_redundancy_rewards(
     """
     Build a normalized request-aware reward for redundant source placement.
 
-    The selected-tree terms still define the main ILP objective. This reward is
-    only a small tie-breaker that tells the z_e variables where to spend
-    remaining budget for routing.
+    This reward is excluded from the default expected-throughput objective. It
+    is kept only for the optional
+    coverage_expected_throughput_with_redundancy ablation.
     """
     rewards = {norm_edge(u, v): 1e-3 for u, v in graph.edges()}
 
@@ -571,18 +627,34 @@ def solve_joint_source_placement_ilp(
     mip_gap: Optional[float] = None,
     solver_seed: Optional[int] = None,
     edge_redundancy_weight: float = 0.05,
+    objective_mode: Optional[str] = None,
+    coverage_priority_weight: Optional[float] = None,
+    use_redundancy_reward: Optional[bool] = None,
+    spend_remaining_budget_after_solve: Optional[bool] = None,
     verbose: bool = True,
 ) -> Dict[str, Any]:
     """
-    Solve the joint ILP.
+    Solve the source-placement ILP.
 
     Variables:
         z_e     integer, number of quantum sources deployed on edge e
         x_{r,t} binary, whether tree t is selected for request r
+        y_r     binary, whether request r is covered by at least one tree
 
     Objective:
-        maximize the number of covered requests first, then select redundant
-        candidate trees for covered requests, using rho_t as a tie-breaker.
+        maximize an expected per-slot throughput surrogate. The default mode is
+
+            M * sum_r y_r + sum_{r,t} w_r * rho_{r,t} * x_{r,t}
+
+        where rho_{r,t} is the candidate-tree success probability:
+
+            product_{e in E_t} p_e
+            * product_{v in swap_nodes(t)} q_swap_v
+            * product_{v in fusion_nodes(t)} q_fus_v
+
+        The ILP uses probabilities as expected values only. It does not know
+        the random realization of a slot; final realized throughput is measured
+        after source deployment, online routing, and stochastic operations.
 
     Demand handling:
         By default, each request can select at most one tree.
@@ -594,6 +666,34 @@ def solve_joint_source_placement_ilp(
         dict containing source placement, selected trees, objective value,
         served requests, and Gurobi status.
     """
+    objective_mode = str(objective_mode or ilp_objective_mode())
+    valid_objective_modes = {
+        "expected_throughput",
+        "coverage_expected_throughput",
+        "coverage_expected_throughput_with_redundancy",
+    }
+    if objective_mode not in valid_objective_modes:
+        raise ValueError(
+            f"Unsupported ILP objective_mode={objective_mode!r}. "
+            f"Expected one of {sorted(valid_objective_modes)}."
+        )
+
+    if coverage_priority_weight is None:
+        coverage_priority_weight = served_request_priority(candidate_trees)
+    coverage_priority_weight = float(coverage_priority_weight)
+
+    if use_redundancy_reward is None:
+        use_redundancy_reward = (
+            objective_mode == "coverage_expected_throughput_with_redundancy"
+            or use_redundancy_reward_by_default()
+        )
+    use_redundancy_reward = bool(use_redundancy_reward)
+    if objective_mode != "coverage_expected_throughput_with_redundancy":
+        use_redundancy_reward = False
+    if spend_remaining_budget_after_solve is None:
+        spend_remaining_budget_after_solve = spend_remaining_budget_after_solve_by_default()
+    spend_remaining_budget_after_solve = bool(spend_remaining_budget_after_solve)
+
     edges = sorted(norm_edge(u, v) for u, v in graph.edges())
     nodes = sorted(graph.nodes())
 
@@ -669,8 +769,9 @@ def solve_joint_source_placement_ilp(
     # -----------------------------
     # Objective
     # -----------------------------
-    obj_terms = []
-    request_priority = served_request_priority(candidate_trees)
+    coverage_terms = []
+    expected_terms = []
+    redundancy_terms = []
     fallback_edges = build_batch_user_path_edges(graph, requests)
     edge_redundancy_rewards = build_edge_redundancy_rewards(
         graph=graph,
@@ -679,25 +780,30 @@ def solve_joint_source_placement_ilp(
     )
     z_decay = z_reward_decay(max_sources_per_edge)
 
-    for req in requests:
-        obj_terms.append(request_priority * y[req.request_id])
+    if objective_mode in {
+        "coverage_expected_throughput",
+        "coverage_expected_throughput_with_redundancy",
+    }:
+        for req in requests:
+            coverage_terms.append(coverage_priority_weight * y[req.request_id])
 
     for req in requests:
         for t in candidate_trees.get(req.request_id, []):
             var = x[(req.request_id, t.tree_id)]
-            obj_terms.append(tree_objective_value(t) * var)
+            expected_terms.append(tree_expected_throughput_value(req, t) * var)
 
-    if edge_redundancy_weight > 0:
+    if use_redundancy_reward and edge_redundancy_weight > 0:
         for e in edges:
             edge_reward = edge_redundancy_rewards.get(e, 0.0)
             for k, decay in enumerate(z_decay):
-                obj_terms.append(
+                redundancy_terms.append(
                     edge_redundancy_weight
                     * edge_reward
                     * float(decay)
                     * z_increment[(e, k)]
                 )
 
+    obj_terms = coverage_terms + expected_terms + redundancy_terms
     model.setObjective(gp.quicksum(obj_terms), GRB.MAXIMIZE)
 
     # -----------------------------
@@ -742,15 +848,21 @@ def solve_joint_source_placement_ilp(
     # sum_{r,t} a_{e,t} x_{r,t} <= z_e
     # -----------------------------
     for e in edges:
+        selected_edge_load = gp.quicksum(
+            x[(req.request_id, t.tree_id)]
+            for req in requests
+            for t in candidate_trees.get(req.request_id, [])
+            if e in t.edges
+        )
         model.addConstr(
-            gp.quicksum(
-                x[(req.request_id, t.tree_id)]
-                for req in requests
-                for t in candidate_trees.get(req.request_id, [])
-                if e in t.edges
-            ) <= z[e],
+            selected_edge_load <= z[e],
             name=f"edge_source_capacity_{e[0]}_{e[1]}",
         )
+        if not use_redundancy_reward:
+            model.addConstr(
+                z[e] <= selected_edge_load,
+                name=f"edge_source_exact_without_redundancy_{e[0]}_{e[1]}",
+            )
 
     # -----------------------------
     # Constraint 4: node-memory capacity
@@ -796,6 +908,17 @@ def solve_joint_source_placement_ilp(
         "served_requests": [],
         "covered_requests": [],
         "request_demands": demand_by_request,
+        "objective_mode": objective_mode,
+        "coverage_priority_weight": coverage_priority_weight,
+        "use_redundancy_reward": use_redundancy_reward,
+        "spend_remaining_budget_after_solve": spend_remaining_budget_after_solve,
+        "ilp_expected_objective": None,
+        "ilp_expected_throughput_term": 0.0,
+        "ilp_coverage_objective_term": 0.0,
+        "ilp_redundancy_objective_term": 0.0,
+        "ilp_covered_requests": 0,
+        "ilp_selected_tree_count": 0,
+        "deployed_source_count": 0,
         "solver_seed": solver_seed,
         "model": model,
     }
@@ -807,6 +930,7 @@ def solve_joint_source_placement_ilp(
         return result
 
     result["objective"] = float(model.ObjVal)
+    result["ilp_expected_objective"] = float(model.ObjVal)
 
     source_placement = {}
     for e in edges:
@@ -817,11 +941,14 @@ def solve_joint_source_placement_ilp(
     selected_trees = []
     served_requests = set()
     routing_source_placement = {}
+    expected_throughput_term = 0.0
 
     for req in requests:
         for t in candidate_trees.get(req.request_id, []):
             var = x[(req.request_id, t.tree_id)]
             if var.X > 0.5:
+                expected_value = tree_expected_throughput_value(req, t)
+                expected_throughput_term += expected_value
                 selected_trees.append(
                     {
                         "request_id": req.request_id,
@@ -832,19 +959,41 @@ def solve_joint_source_placement_ilp(
                         "fusion_nodes": t.fusion_nodes,
                         "memory": t.memory,
                         "rho": t.rho,
-                        "objective_contribution": tree_objective_value(t),
+                        "expected_throughput_contribution": expected_value,
+                        "objective_contribution": expected_value,
                     }
                 )
                 served_requests.add(req.request_id)
                 for e in t.edges:
                     routing_source_placement[e] = routing_source_placement.get(e, 0) + 1
 
+    covered_requests = [
+        req.request_id for req in requests if y[req.request_id].X > 0.5
+    ]
+    coverage_objective_term = (
+        coverage_priority_weight * len(covered_requests)
+        if objective_mode in {
+            "coverage_expected_throughput",
+            "coverage_expected_throughput_with_redundancy",
+        }
+        else 0.0
+    )
+    redundancy_objective_term = 0.0
+    if use_redundancy_reward and edge_redundancy_weight > 0:
+        for e in edges:
+            edge_reward = edge_redundancy_rewards.get(e, 0.0)
+            for k, decay in enumerate(z_decay):
+                redundancy_objective_term += (
+                    edge_redundancy_weight
+                    * edge_reward
+                    * float(decay)
+                    * float(z_increment[(e, k)].X)
+                )
+
     result["source_placement"] = source_placement
     result["selected_trees"] = selected_trees
     result["served_requests"] = sorted(served_requests)
-    result["covered_requests"] = [
-        req.request_id for req in requests if y[req.request_id].X > 0.5
-    ]
+    result["covered_requests"] = covered_requests
     redundant = allocate_redundant_source_placement(
         selected_trees=selected_trees,
         source_budget=source_budget,
@@ -855,9 +1004,26 @@ def solve_joint_source_placement_ilp(
         fallback_edges=fallback_edges,
         enforce_node_memory_for_redundancy=True,
     )
+    deployed_source_placement = (
+        redundant["routing_source_placement"]
+        if spend_remaining_budget_after_solve
+        else source_placement
+    )
+    deployed_used_budget = (
+        redundant["used_budget"]
+        if spend_remaining_budget_after_solve
+        else source_cost * sum(source_placement.values())
+    )
     result["minimum_routing_source_placement"] = dict(sorted(routing_source_placement.items()))
-    result["routing_source_placement"] = dict(sorted(source_placement.items()))
+    result["routing_source_placement"] = dict(sorted(deployed_source_placement.items()))
     result["ilp_optimized_z_used_budget"] = source_cost * sum(source_placement.values())
+    result["deployed_source_count"] = sum(deployed_source_placement.values())
+    result["deployed_used_budget"] = deployed_used_budget
+    result["ilp_expected_throughput_term"] = expected_throughput_term
+    result["ilp_coverage_objective_term"] = coverage_objective_term
+    result["ilp_redundancy_objective_term"] = redundancy_objective_term
+    result["ilp_covered_requests"] = len(covered_requests)
+    result["ilp_selected_tree_count"] = len(selected_trees)
     result["redundant_used_budget"] = redundant["used_budget"]
     result["redundant_routing_source_placement"] = redundant["routing_source_placement"]
     result["redundant_memory_load"] = redundant["memory_load"]
@@ -963,7 +1129,11 @@ def solve_single_slot_ilp_request_batch(
     This is the ILP-side counterpart of
     run_simulator_single_slot_multi_request.py:
       - request_batch is the same list of requests used by heuristic methods.
-      - objective is throughput per slot, sum x_{r,t}.
+      - the source-placement ILP maximizes an expected per-slot throughput
+        surrogate using the same physical probability parameters as the
+        simulator.
+      - it does not know the actual random realization in the slot; realized
+        throughput is measured later by stochastic routing/simulation.
       - all randomized candidate generation and solver randomness are derived
         from master_seed.
     """
@@ -1029,7 +1199,14 @@ def solve_single_slot_ilp_request_batch(
     result["throughput_selected_trees"] = len(result["selected_trees"])
     result["throughput_covered_requests"] = len(result.get("covered_requests", result["served_requests"]))
     result["throughput_qbps"] = result["throughput_covered_requests"]
-    result["throughput_expected_objective"] = result["objective"] or 0.0
+    result["ilp_expected_objective"] = result.get("ilp_expected_objective", result["objective"] or 0.0)
+    result["ilp_expected_throughput_term"] = result.get("ilp_expected_throughput_term", 0.0)
+    result["ilp_covered_requests"] = result.get("ilp_covered_requests", result["throughput_covered_requests"])
+    result["ilp_selected_tree_count"] = result.get("ilp_selected_tree_count", result["throughput_selected_trees"])
+    result["deployed_source_count"] = result.get(
+        "deployed_source_count",
+        sum(result.get("routing_source_placement", {}).values()),
+    )
     result["request_batch"] = [list(req) for req in request_batch]
     result["master_seed"] = master_seed
     result["candidate_seed"] = candidate_seed
@@ -1048,7 +1225,8 @@ def print_ilp_result(result: Dict[str, Any]) -> None:
     print("[ILP Result]")
     print("=" * 80)
     print(f"Status: {result['status_name']}")
-    print(f"Objective: {result['objective']}")
+    print(f"ILP expected objective: {result.get('ilp_expected_objective', result['objective'])}")
+    print(f"Expected throughput term: {result.get('ilp_expected_throughput_term', 0.0)}")
     print(f"Served requests: {result['served_requests']}")
     print(f"Request demands D_r: {result.get('request_demands', {})}")
 
