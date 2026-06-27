@@ -1,23 +1,12 @@
 """
-ILP-based Joint Quantum Source Placement and Multipartite Tree Selection.
+REPS-style multipartite source/link provisioning ILP.
 
-This module implements the journal-extension ILP:
+The ILP decides global edge-level source placement z_e. Integer x_{r,t}
+variables represent provisioning-stage multipartite service units over
+candidate tree patterns, not final realized GHZ routing trees.
 
-    max sum_{r in R} sum_{t in T_r} x_{r,t}
-
-subject to:
-    source budget
-    per-edge source cap
-    at most one selected tree per request
-    edge-source capacity coupling
-    node-memory capacity
-    binary/integer domains
-
-It is designed to be compatible with the existing repository:
-    - network_topology.py
-    - network_request.py
-    - steiner_tree_algorithms.py
-
+Realized throughput is measured later by the simulator after stochastic Bell
+link generation and online multipartite routing over the successful-link graph.
 """
 
 from __future__ import annotations
@@ -70,6 +59,122 @@ def edge_success_prob(
     return float(p_op * transmittance)
 
 
+def build_edge_generation_probabilities(
+    graph: nx.Graph,
+    edges: Iterable[Edge],
+    p_op: float = 0.8,
+) -> Dict[Edge, float]:
+    """Return p_e for every physical edge used by the provisioning model."""
+    edge_generation_prob: Dict[Edge, float] = {}
+    for edge in edges:
+        u, v = edge
+        data = graph.get_edge_data(u, v, default={}) or {}
+        length_km = float(data.get("length_km", data.get("weight", 1.0)))
+        edge_generation_prob[edge] = edge_success_prob(length_km=length_km, p_op=p_op)
+    return edge_generation_prob
+
+
+def validate_integer_provisioning_solution(
+    graph: nx.Graph,
+    requests: List["MultipartiteRequest"],
+    candidate_trees: Dict[int, List["CandidateTree"]],
+    source_placement: Dict[Edge, int],
+    x_values: Dict[Tuple[int, int], int],
+    source_budget: int,
+    max_sources_per_edge: int,
+    node_memory: Optional[Dict[Any, int]] = None,
+    source_cost: int = 1,
+    edge_generation_prob: Optional[Dict[Edge, float]] = None,
+    p_op: float = 0.8,
+    tol: float = 1e-6,
+) -> Dict[str, Any]:
+    """
+    Validate an integer REPS provisioning solution.
+
+    Checks the source/link-generation attempt placement z_e and tree-service
+    provisioning variables x_{r,t} against the source budget, per-edge source
+    limit, expected edge-capacity constraint, node memory for incident
+    source/link-generation attempts, and integer nonnegative domains.
+    """
+    edges = sorted(norm_edge(u, v) for u, v in graph.edges())
+    nodes = sorted(graph.nodes())
+    if node_memory is None:
+        node_memory = {v: 10**6 for v in nodes}
+    if edge_generation_prob is None:
+        edge_generation_prob = build_edge_generation_probabilities(graph, edges, p_op=p_op)
+
+    tree_lookup = {
+        (req_id, tree.tree_id): tree
+        for req_id, trees in candidate_trees.items()
+        for tree in trees
+    }
+    z_all = {edge: int(source_placement.get(edge, 0)) for edge in edges}
+    x_all = {key: int(value) for key, value in x_values.items() if int(value) != 0}
+    violations: List[str] = []
+
+    for edge, value in source_placement.items():
+        if edge not in z_all:
+            violations.append(f"source placement uses non-physical edge {edge}")
+        if abs(float(value) - round(float(value))) > tol or int(round(float(value))) < 0:
+            violations.append(f"z[{edge}] is not a nonnegative integer: {value}")
+
+    for key, value in x_values.items():
+        if key not in tree_lookup:
+            violations.append(f"x{key} does not correspond to a candidate tree")
+        if abs(float(value) - round(float(value))) > tol or int(round(float(value))) < 0:
+            violations.append(f"x{key} is not a nonnegative integer: {value}")
+
+    used_budget = source_cost * sum(z_all.values())
+    if used_budget > source_budget + tol:
+        violations.append(f"source budget violated: {used_budget} > {source_budget}")
+
+    for edge, value in z_all.items():
+        if value < -tol:
+            violations.append(f"negative z[{edge}]={value}")
+        if value > max_sources_per_edge + tol:
+            violations.append(f"edge source limit violated on {edge}: {value} > {max_sources_per_edge}")
+
+    node_load = {node: 0 for node in nodes}
+    for edge, value in z_all.items():
+        u, v = edge
+        node_load[u] = node_load.get(u, 0) + value
+        node_load[v] = node_load.get(v, 0) + value
+    for node, load in node_load.items():
+        cap = int(node_memory.get(node, 0))
+        if load > cap + tol:
+            violations.append(f"node memory violated at {node}: {load} > {cap}")
+
+    edge_demand = {edge: 0 for edge in edges}
+    for key, units in x_all.items():
+        tree = tree_lookup.get(key)
+        if tree is None:
+            continue
+        for edge in tree.edges:
+            edge_demand[edge] = edge_demand.get(edge, 0) + units
+
+    for edge in edges:
+        demand = edge_demand.get(edge, 0)
+        capacity = float(edge_generation_prob.get(edge, 0.0)) * z_all.get(edge, 0)
+        if demand > capacity + tol:
+            violations.append(
+                f"expected edge-capacity violated on {edge}: demand {demand} > p_e z_e {capacity:.9g}"
+            )
+
+    return {
+        "feasible": not violations,
+        "violations": violations,
+        "used_budget": used_budget,
+        "source_placement": {edge: value for edge, value in z_all.items() if value > 0},
+        "x_values": {key: value for key, value in x_all.items() if value > 0},
+        "edge_demand": edge_demand,
+        "edge_capacity": {
+            edge: float(edge_generation_prob.get(edge, 0.0)) * z_all.get(edge, 0)
+            for edge in edges
+        },
+        "node_memory_load": node_load,
+    }
+
+
 @dataclass
 class MultipartiteRequest:
     """A multipartite request represented by a terminal/user set."""
@@ -83,6 +188,9 @@ class MultipartiteRequest:
 class CandidateTree:
     """
     Candidate Steiner-like tree for one multipartite request.
+
+    The `memory` field is retained only for backward-compatible object shape
+    and is not used by the current REPS ILP, ILP-CG, or LP-R formulations.
     """
     tree_id: int
     request_id: int
@@ -99,192 +207,28 @@ class CandidateTree:
 
 def tree_objective_value(tree: CandidateTree) -> float:
     """
-    Expected-throughput utility for selecting one candidate tree.
+    Operation-level utility for provisioning one candidate tree service unit.
 
-    Candidate trees are source-placement guides. The ILP uses the same
-    physical probabilities as the stochastic simulator, but only as expected
-    values. The simulator later samples actual link generation, swapping, and
-    fusion outcomes.
+    In the REPS-style source provisioning ILP, edge generation probability is
+    handled by the expected edge-capacity constraint p_e z_e. The tree rho used
+    in the objective includes only non-link operations such as swapping and
+    fusion.
     """
     return float(tree.rho)
-
-
-def request_priority_weight(request: MultipartiteRequest) -> float:
-    """Return the expected-throughput priority weight for one request."""
-    return float(getattr(request, "weight", 1.0) or 1.0)
 
 
 def tree_expected_throughput_value(
     request: MultipartiteRequest,
     tree: CandidateTree,
 ) -> float:
-    """Return w_r * rho_{r,t} for the ILP expected-throughput term."""
-    return request_priority_weight(request) * tree_objective_value(tree)
+    """Return rho^{op}_{r,t} for the REPS provisioning objective."""
+    del request
+    return tree_objective_value(tree)
 
 
 def ilp_objective_mode() -> str:
-    """Return the configured source-placement expected objective mode."""
-    try:
-        import single_slot_throughput_sweep_conditions as conditions
-
-        return str(
-            getattr(
-                conditions,
-                "ILP_OBJECTIVE_MODE",
-                getattr(conditions, "objective_mode", "coverage_expected_throughput"),
-            )
-        )
-    except (ImportError, AttributeError):
-        return "coverage_expected_throughput"
-
-
-def use_redundancy_reward_by_default() -> bool:
-    """Return whether the z_e diminishing-return reward is enabled."""
-    try:
-        import single_slot_throughput_sweep_conditions as conditions
-
-        return bool(getattr(conditions, "ILP_USE_REDUNDANCY_REWARD", False))
-    except (ImportError, AttributeError):
-        return False
-
-
-def spend_remaining_budget_after_solve_by_default() -> bool:
-    """Return whether to deploy unused budget after the clean ILP solve."""
-    try:
-        import single_slot_throughput_sweep_conditions as conditions
-
-        return bool(getattr(conditions, "ILP_SPEND_REMAINING_BUDGET_AFTER_SOLVE", True))
-    except (ImportError, AttributeError):
-        return True
-
-
-def served_request_priority(candidate_trees: Dict[int, List[CandidateTree]]) -> float:
-    """Return the coverage-first weight M for one additional covered request."""
-    try:
-        import single_slot_throughput_sweep_conditions as conditions
-
-        return float(
-            getattr(
-                conditions,
-                "ILP_COVERAGE_PRIORITY_WEIGHT",
-                getattr(conditions, "ILP_REQUEST_PRIORITY", 1000.0),
-            )
-        )
-    except (ImportError, AttributeError):
-        return 1000.0
-
-
-def z_reward_decay(max_sources_per_edge: int) -> List[float]:
-    """Return diminishing reward multipliers for incremental sources on one edge."""
-    try:
-        import single_slot_throughput_sweep_conditions as conditions
-
-        values = [float(value) for value in conditions.ILP_Z_REWARD_DECAY]
-    except (ImportError, AttributeError):
-        values = [1.0, 0.7, 0.4, 0.2, 0.1, 0.05, 0.025]
-
-    if not values:
-        values = [1.0]
-
-    while len(values) < int(max_sources_per_edge):
-        values.append(values[-1] * 0.5)
-
-    return values[: int(max_sources_per_edge)]
-
-
-def allocate_redundant_source_placement(
-    selected_trees: List[Dict[str, Any]],
-    source_budget: int,
-    max_sources_per_edge: int,
-    node_memory: Optional[Dict[Any, int]] = None,
-    source_cost: int = 1,
-    candidate_trees: Optional[Dict[int, List[CandidateTree]]] = None,
-    fallback_edges: Optional[Iterable[Edge]] = None,
-    enforce_node_memory_for_redundancy: bool = True,
-) -> Dict[str, Any]:
-    """
-    Convert selected request trees into a routing source placement and spend
-    remaining budget as redundant sources on request-relevant candidate edges.
-
-    The initial placement puts one source on every selected tree edge. Extra
-    sources are added round-robin to the lowest-load candidate edges, preferring
-    edges that appear in higher-quality candidate trees. Extra sources obey the
-    same per-edge capacity and, when node_memory is provided, node-memory
-    capacity used by the ILP model.
-    """
-    edge_load: Dict[Edge, int] = {}
-    edge_score: Dict[Edge, float] = {}
-    candidate_edge_set = set()
-
-    for tree in selected_trees:
-        rho = float(tree.get("rho", 1.0) or 0.0)
-        for edge in tree.get("edges", []):
-            edge_key = norm_edge(edge[0], edge[1])
-            candidate_edge_set.add(edge_key)
-            edge_load[edge_key] = edge_load.get(edge_key, 0) + 1
-            edge_score[edge_key] = edge_score.get(edge_key, 0.0) + rho
-
-    if candidate_trees is not None:
-        for trees in candidate_trees.values():
-            for tree in trees:
-                for edge in tree.edges:
-                    edge_key = norm_edge(edge[0], edge[1])
-                    candidate_edge_set.add(edge_key)
-                    edge_score[edge_key] = edge_score.get(edge_key, 0.0) + float(tree.rho)
-
-    if fallback_edges is not None:
-        for edge in fallback_edges:
-            edge_key = norm_edge(edge[0], edge[1])
-            candidate_edge_set.add(edge_key)
-            edge_score.setdefault(edge_key, 0.0)
-
-    node_load: Dict[Any, int] = {}
-    for edge, count in edge_load.items():
-        u, v = edge
-        node_load[u] = node_load.get(u, 0) + count
-        node_load[v] = node_load.get(v, 0) + count
-
-    def has_node_capacity(edge: Edge) -> bool:
-        if node_memory is None or not enforce_node_memory_for_redundancy:
-            return True
-        u, v = edge
-        return (
-            node_load.get(u, 0) + 1 <= int(node_memory.get(u, 0))
-            and node_load.get(v, 0) + 1 <= int(node_memory.get(v, 0))
-        )
-
-    used_budget = source_cost * sum(edge_load.values())
-    while used_budget + source_cost <= source_budget:
-        candidates = [
-            edge
-            for edge in candidate_edge_set
-            if edge_load.get(edge, 0) < max_sources_per_edge and has_node_capacity(edge)
-        ]
-        if not candidates:
-            break
-
-        chosen = min(
-            candidates,
-            key=lambda edge: (
-                edge_load.get(edge, 0),
-                -edge_score.get(edge, 0.0),
-                edge[0],
-                edge[1],
-            ),
-        )
-        edge_load[chosen] = edge_load.get(chosen, 0) + 1
-        u, v = chosen
-        node_load[u] = node_load.get(u, 0) + 1
-        node_load[v] = node_load.get(v, 0) + 1
-        used_budget += source_cost
-
-    return {
-        "routing_source_placement": dict(sorted(edge_load.items())),
-        "used_budget": used_budget,
-        "memory_load": dict(sorted(node_load.items())),
-        "candidate_edge_count": len(candidate_edge_set),
-        "effective_capacity": len(candidate_edge_set) * max_sources_per_edge,
-    }
+    """Return the active source-provisioning objective mode."""
+    return "reps_source_provisioning"
 
 
 def generate_diverse_steiner_trees(
@@ -389,26 +333,6 @@ def identify_operation_nodes(
     return plan.swap_nodes, fusion_nodes
 
 
-def compute_tree_memory(
-    tree: nx.Graph,
-    terminals: Iterable[Any],
-    memory_model: str = "degree",
-) -> Dict[Any, int]:
-    """
-    Compute node memory consumption of one tree.
-
-    First journal-version model:
-        m_{v,t} = degree of v in tree
-
-    This corresponds to one local memory qubit per incident entanglement link.
-    """
-    if memory_model != "degree":
-        raise ValueError("Currently only memory_model='degree' is implemented.")
-
-    memory = {v: int(tree.degree(v)) for v in tree.nodes()}
-    return memory
-
-
 def compute_tree_success_probability(
     tree: nx.Graph,
     swap_nodes: Iterable[Any],
@@ -422,34 +346,23 @@ def compute_tree_success_probability(
     weight_attr: str = "length_km",
 ) -> float:
     """
-    Compute tree-level success probability:
+    Compute operation-level tree success probability:
 
         rho_t =
-            prod_{e in E_t} p_e
-            * prod_{v in V_swap} q_v^swap
+            prod_{v in V_swap} q_v^swap
             * prod_{v in V_fus} q_v^fus
 
-    q_swap and q_fus can be constants first.
-    Later they can be dictionaries if node-dependent probabilities are needed.
+    Edge generation probabilities are intentionally excluded here. They are
+    represented in the REPS expected edge-capacity constraint p_e z_e.
     """
+    del p_op, q_rem, loss_coef_db_per_km, weight_attr
     rho = 1.0
-
-    for u, v, data in tree.edges(data=True):
-        length_km = float(data.get(weight_attr, data.get("weight", 1.0)))
-        rho *= edge_success_prob(
-            length_km=length_km,
-            p_op=p_op,
-            loss_coef_db_per_km=loss_coef_db_per_km,
-        )
 
     for node in swap_nodes:
         rho *= probability_for(node, q_swap)
 
     for node in fusion_nodes:
         rho *= probability_for(node, q_fus)
-
-    for node in removal_nodes or []:
-        rho *= probability_for(node, q_rem)
 
     return float(rho)
 
@@ -502,12 +415,6 @@ def build_candidate_trees_for_requests(
             fusion_nodes = plan.fusion_nodes
             removal_nodes = plan.candidate_removal_nodes
 
-            memory = compute_tree_memory(
-                T,
-                terminals=req.terminals,
-                memory_model="degree",
-            )
-
             rho = plan.rho
 
             if rho < rho_min:
@@ -525,7 +432,7 @@ def build_candidate_trees_for_requests(
                     edges=edges,
                     swap_nodes=list(swap_nodes),
                     fusion_nodes=list(fusion_nodes),
-                    memory=memory,
+                    memory={},
                     rho=rho,
                     reduced_edges=reduced_edges,
                     removal_nodes=list(removal_nodes),
@@ -545,11 +452,10 @@ def build_batch_user_path_edges(
     weight_attr: str = "length_km",
 ) -> List[Edge]:
     """
-    Build request-aware fallback edges from shortest paths between batch users.
+    Build request-aware shortest-path edges for non-ILP heuristics.
 
-    These edges are used only for redundant source placement after tree
-    selection. They prevent unused budget without falling back to topology-wide
-    all-edge placement.
+    The current Full ILP, ILP-CG, and LP-R default paths do not use this for
+    source placement post-processing.
     """
     users = []
     seen = set()
@@ -580,38 +486,6 @@ def build_batch_user_path_edges(
     return sorted(edges)
 
 
-def build_edge_redundancy_rewards(
-    graph: nx.Graph,
-    candidate_trees: Dict[int, List[CandidateTree]],
-    fallback_edges: Optional[Iterable[Edge]] = None,
-) -> Dict[Edge, float]:
-    """
-    Build a normalized request-aware reward for redundant source placement.
-
-    This reward is excluded from the default expected-throughput objective. It
-    is kept only for the optional
-    coverage_expected_throughput_with_redundancy ablation.
-    """
-    rewards = {norm_edge(u, v): 1e-3 for u, v in graph.edges()}
-
-    for trees in candidate_trees.values():
-        for tree in trees:
-            tree_reward = tree_objective_value(tree)
-            for edge in tree.edges:
-                edge_key = norm_edge(edge[0], edge[1])
-                rewards[edge_key] = rewards.get(edge_key, 1e-3) + tree_reward
-
-    if fallback_edges is not None:
-        for edge in fallback_edges:
-            edge_key = norm_edge(edge[0], edge[1])
-            rewards[edge_key] = rewards.get(edge_key, 1e-3) + 0.5
-
-    max_reward = max(rewards.values(), default=1.0)
-    if max_reward <= 0:
-        return rewards
-    return {edge: value / max_reward for edge, value in rewards.items()}
-
-
 def solve_joint_source_placement_ilp(
     graph: nx.Graph,
     requests: List[MultipartiteRequest],
@@ -620,79 +494,41 @@ def solve_joint_source_placement_ilp(
     max_sources_per_edge: int = 5,
     node_memory: Optional[Dict[Any, int]] = None,
     source_cost: int = 1,
+    p_op: float = 0.8,
     allow_multiple_trees_per_request: bool = False,
     demand_per_request: int = 1,
     request_demands: Optional[Dict[int, int]] = None,
     time_limit: Optional[float] = None,
     mip_gap: Optional[float] = None,
     solver_seed: Optional[int] = None,
-    edge_redundancy_weight: float = 0.05,
     objective_mode: Optional[str] = None,
-    coverage_priority_weight: Optional[float] = None,
-    use_redundancy_reward: Optional[bool] = None,
-    spend_remaining_budget_after_solve: Optional[bool] = None,
     verbose: bool = True,
 ) -> Dict[str, Any]:
     """
-    Solve the source-placement ILP.
+    Solve the REPS-style multipartite source provisioning ILP.
 
-    Variables:
-        z_e     integer, number of quantum sources deployed on edge e
-        x_{r,t} binary, whether tree t is selected for request r
-        y_r     binary, whether request r is covered by at least one tree
+    This model decides edge-level source/link-generation attempts z_e. The
+    x_{r,t} variables are integer provisioning-stage service units for
+    candidate tree patterns, not final realized routing trees. Link generation
+    realization and online GHZ routing are evaluated later by the simulator.
 
-    Objective:
-        maximize an expected per-slot throughput surrogate. The default mode is
+    Active model:
 
-            M * sum_r y_r + sum_{r,t} w_r * rho_{r,t} * x_{r,t}
+        max sum_{r,t} rho_op[r,t] x_{r,t}
 
-        where rho_{r,t} is the candidate-tree success probability:
+        sum_e C_s z_e <= B
+        0 <= z_e <= Z_e^max
+        sum_{r,t:e in E_t} x_{r,t} <= p_e z_e
+        sum_{e incident to v} z_e <= M_v
 
-            product_{e in E_t} p_e
-            * product_{v in swap_nodes(t)} q_swap_v
-            * product_{v in fusion_nodes(t)} q_fus_v
-
-        The ILP uses probabilities as expected values only. It does not know
-        the random realization of a slot; final realized throughput is measured
-        after source deployment, online routing, and stochastic operations.
-
-    Demand handling:
-        By default, each request can select at most one tree.
-        If allow_multiple_trees_per_request=True, request r can select up to
-        D_r trees, where D_r is read from request_demands[r] if provided,
-        otherwise from req.demand, otherwise from demand_per_request.
+    Caller compatibility parameters unrelated to REPS provisioning are ignored.
 
     Returns:
-        dict containing source placement, selected trees, objective value,
-        served requests, and Gurobi status.
+        dict containing source placement z_e, provisioned tree service units,
+        objective value, and Gurobi status.
     """
-    objective_mode = str(objective_mode or ilp_objective_mode())
-    valid_objective_modes = {
-        "expected_throughput",
-        "coverage_expected_throughput",
-        "coverage_expected_throughput_with_redundancy",
-    }
-    if objective_mode not in valid_objective_modes:
-        raise ValueError(
-            f"Unsupported ILP objective_mode={objective_mode!r}. "
-            f"Expected one of {sorted(valid_objective_modes)}."
-        )
-
-    if coverage_priority_weight is None:
-        coverage_priority_weight = served_request_priority(candidate_trees)
-    coverage_priority_weight = float(coverage_priority_weight)
-
-    if use_redundancy_reward is None:
-        use_redundancy_reward = (
-            objective_mode == "coverage_expected_throughput_with_redundancy"
-            or use_redundancy_reward_by_default()
-        )
-    use_redundancy_reward = bool(use_redundancy_reward)
-    if objective_mode != "coverage_expected_throughput_with_redundancy":
-        use_redundancy_reward = False
-    if spend_remaining_budget_after_solve is None:
-        spend_remaining_budget_after_solve = spend_remaining_budget_after_solve_by_default()
-    spend_remaining_budget_after_solve = bool(spend_remaining_budget_after_solve)
+    del allow_multiple_trees_per_request, demand_per_request, request_demands
+    objective_mode = "reps_source_provisioning"
 
     edges = sorted(norm_edge(u, v) for u, v in graph.edges())
     nodes = sorted(graph.nodes())
@@ -701,22 +537,9 @@ def solve_joint_source_placement_ilp(
         # Default memory capacity: large enough not to bind.
         node_memory = {v: 10**6 for v in nodes}
 
-    demand_by_request = {}
-    for req in requests:
-        if request_demands is not None and req.request_id in request_demands:
-            demand = int(request_demands[req.request_id])
-        elif allow_multiple_trees_per_request:
-            req_demand = int(getattr(req, "demand", 1))
-            demand = req_demand if req_demand != 1 else int(demand_per_request)
-        else:
-            demand = 1
+    edge_generation_prob = build_edge_generation_probabilities(graph, edges, p_op=p_op)
 
-        if demand < 1:
-            raise ValueError(f"Request demand must be >= 1 for request {req.request_id}.")
-
-        demand_by_request[req.request_id] = demand
-
-    model = gp.Model("joint_source_placement_multipartite_tree_selection")
+    model = gp.Model("reps_multipartite_source_provisioning")
 
     if not verbose:
         model.Params.OutputFlag = 0
@@ -742,25 +565,13 @@ def solve_joint_source_placement_ilp(
         )
         for e in edges
     }
-    z_increment = {
-        (e, k): model.addVar(
-            vtype=GRB.BINARY,
-            name=f"u_{e[0]}_{e[1]}_{k + 1}",
-        )
-        for e in edges
-        for k in range(max_sources_per_edge)
-    }
 
     x = {}
-    y = {}
     for req in requests:
-        y[req.request_id] = model.addVar(
-            vtype=GRB.BINARY,
-            name=f"y_r{req.request_id}",
-        )
         for t in candidate_trees.get(req.request_id, []):
             x[(req.request_id, t.tree_id)] = model.addVar(
-                vtype=GRB.BINARY,
+                vtype=GRB.INTEGER,
+                lb=0,
                 name=f"x_r{req.request_id}_t{t.tree_id}",
             )
 
@@ -769,42 +580,14 @@ def solve_joint_source_placement_ilp(
     # -----------------------------
     # Objective
     # -----------------------------
-    coverage_terms = []
-    expected_terms = []
-    redundancy_terms = []
-    fallback_edges = build_batch_user_path_edges(graph, requests)
-    edge_redundancy_rewards = build_edge_redundancy_rewards(
-        graph=graph,
-        candidate_trees=candidate_trees,
-        fallback_edges=fallback_edges,
+    model.setObjective(
+        gp.quicksum(
+            tree_expected_throughput_value(req, t) * x[(req.request_id, t.tree_id)]
+            for req in requests
+            for t in candidate_trees.get(req.request_id, [])
+        ),
+        GRB.MAXIMIZE,
     )
-    z_decay = z_reward_decay(max_sources_per_edge)
-
-    if objective_mode in {
-        "coverage_expected_throughput",
-        "coverage_expected_throughput_with_redundancy",
-    }:
-        for req in requests:
-            coverage_terms.append(coverage_priority_weight * y[req.request_id])
-
-    for req in requests:
-        for t in candidate_trees.get(req.request_id, []):
-            var = x[(req.request_id, t.tree_id)]
-            expected_terms.append(tree_expected_throughput_value(req, t) * var)
-
-    if use_redundancy_reward and edge_redundancy_weight > 0:
-        for e in edges:
-            edge_reward = edge_redundancy_rewards.get(e, 0.0)
-            for k, decay in enumerate(z_decay):
-                redundancy_terms.append(
-                    edge_redundancy_weight
-                    * edge_reward
-                    * float(decay)
-                    * z_increment[(e, k)]
-                )
-
-    obj_terms = coverage_terms + expected_terms + redundancy_terms
-    model.setObjective(gp.quicksum(obj_terms), GRB.MAXIMIZE)
 
     # -----------------------------
     # Constraint 1: source budget
@@ -814,38 +597,10 @@ def solve_joint_source_placement_ilp(
         name="source_budget",
     )
 
-    for e in edges:
-        model.addConstr(
-            z[e] == gp.quicksum(z_increment[(e, k)] for k in range(max_sources_per_edge)),
-            name=f"source_increment_sum_{e[0]}_{e[1]}",
-        )
-        for k in range(1, max_sources_per_edge):
-            model.addConstr(
-                z_increment[(e, k)] <= z_increment[(e, k - 1)],
-                name=f"source_increment_order_{e[0]}_{e[1]}_{k + 1}",
-            )
-
     # -----------------------------
-    # Constraint 2: request coverage and redundant tree limit
-    # -----------------------------
-    for req in requests:
-        selected_for_request = gp.quicksum(
-            x[(req.request_id, t.tree_id)]
-            for t in candidate_trees.get(req.request_id, [])
-        )
-        model.addConstr(
-            selected_for_request >= y[req.request_id],
-            name=f"request_coverage_lower_r{req.request_id}",
-        )
-        model.addConstr(
-            selected_for_request <= demand_by_request[req.request_id] * y[req.request_id],
-            name=f"request_tree_limit_r{req.request_id}",
-        )
-
-    # -----------------------------
-    # Constraint 3: edge-source capacity
+    # Constraint 2: REPS expected edge-capacity
     #
-    # sum_{r,t} a_{e,t} x_{r,t} <= z_e
+    # sum_{r,t} a_{e,t} x_{r,t} <= p_e z_e
     # -----------------------------
     for e in edges:
         selected_edge_load = gp.quicksum(
@@ -855,37 +610,23 @@ def solve_joint_source_placement_ilp(
             if e in t.edges
         )
         model.addConstr(
-            selected_edge_load <= z[e],
-            name=f"edge_source_capacity_{e[0]}_{e[1]}",
+            selected_edge_load <= edge_generation_prob[e] * z[e],
+            name=f"expected_edge_capacity_{e[0]}_{e[1]}",
         )
-        if not use_redundancy_reward:
-            model.addConstr(
-                z[e] <= selected_edge_load,
-                name=f"edge_source_exact_without_redundancy_{e[0]}_{e[1]}",
-            )
 
     # -----------------------------
-    # Constraint 4: node-memory capacity
+    # Constraint 3: Bell-link generation node-memory capacity
     #
-    # sum_{r,t} m_{v,t} x_{r,t} <= M_v
     # sum_{e incident to v} z_e <= M_v
     # -----------------------------
     for v in nodes:
-        model.addConstr(
-            gp.quicksum(
-                t.memory.get(v, 0) * x[(req.request_id, t.tree_id)]
-                for req in requests
-                for t in candidate_trees.get(req.request_id, [])
-            ) <= int(node_memory.get(v, 0)),
-            name=f"node_memory_{v}",
-        )
         model.addConstr(
             gp.quicksum(
                 z[e]
                 for e in edges
                 if v in e
             ) <= int(node_memory.get(v, 0)),
-            name=f"node_memory_source_placement_{v}",
+            name=f"node_memory_{v}",
         )
 
     # -----------------------------
@@ -901,36 +642,55 @@ def solve_joint_source_placement_ilp(
     result = {
         "status": status,
         "status_name": status_to_string(status),
+        "solution_status": "not_solved",
         "objective": None,
+        "objective_bound": None,
+        "mip_gap": None,
         "source_placement": {},
         "routing_source_placement": {},
         "selected_trees": [],
+        "provisioned_tree_units": [],
+        "x_values": {},
+        "edge_generation_prob": edge_generation_prob,
         "served_requests": [],
-        "covered_requests": [],
-        "request_demands": demand_by_request,
+        "request_demands": None,
+        "request_demand_bound_enabled": False,
         "objective_mode": objective_mode,
-        "coverage_priority_weight": coverage_priority_weight,
-        "use_redundancy_reward": use_redundancy_reward,
-        "spend_remaining_budget_after_solve": spend_remaining_budget_after_solve,
         "ilp_expected_objective": None,
-        "ilp_expected_throughput_term": 0.0,
-        "ilp_coverage_objective_term": 0.0,
-        "ilp_redundancy_objective_term": 0.0,
-        "ilp_covered_requests": 0,
-        "ilp_selected_tree_count": 0,
+        "ilp_operation_objective_term": 0.0,
+        "ilp_provisioned_units": 0,
         "deployed_source_count": 0,
         "solver_seed": solver_seed,
+        "is_exact_over_candidate_set": False,
+        "optimality_note": (
+            "Full ILP is exact only over the pre-generated candidate tree set; "
+            "it is not globally optimal over all multipartite trees unless that set is exhaustive."
+        ),
+        "feasibility_check": {"feasible": False, "violations": ["no solution extracted"]},
         "model": model,
     }
 
-    if status not in [GRB.OPTIMAL, GRB.TIME_LIMIT, GRB.SUBOPTIMAL]:
-        return result
+    if status == GRB.OPTIMAL:
+        result["solution_status"] = "optimal"
+        result["is_exact_over_candidate_set"] = True
+    elif status in [GRB.TIME_LIMIT, GRB.SUBOPTIMAL]:
+        result["solution_status"] = "best_incumbent"
+    else:
+        raise RuntimeError(f"ILP failed with status {status_to_string(status)} ({status})")
 
     if model.SolCount == 0:
-        return result
+        raise RuntimeError(f"ILP status {status_to_string(status)} but no incumbent solution is available")
 
     result["objective"] = float(model.ObjVal)
     result["ilp_expected_objective"] = float(model.ObjVal)
+    try:
+        result["objective_bound"] = float(model.ObjBound)
+    except (gp.GurobiError, AttributeError):
+        result["objective_bound"] = None
+    try:
+        result["mip_gap"] = float(model.MIPGap)
+    except (gp.GurobiError, AttributeError):
+        result["mip_gap"] = None
 
     source_placement = {}
     for e in edges:
@@ -938,100 +698,77 @@ def solve_joint_source_placement_ilp(
         if val > 0:
             source_placement[e] = val
 
-    selected_trees = []
+    provisioned_tree_units = []
     served_requests = set()
-    routing_source_placement = {}
-    expected_throughput_term = 0.0
+    expected_operation_term = 0.0
+    provisioned_unit_count = 0
 
     for req in requests:
         for t in candidate_trees.get(req.request_id, []):
             var = x[(req.request_id, t.tree_id)]
-            if var.X > 0.5:
+            units = int(round(var.X))
+            if units > 0:
                 expected_value = tree_expected_throughput_value(req, t)
-                expected_throughput_term += expected_value
-                selected_trees.append(
+                expected_operation_term += expected_value * units
+                provisioned_unit_count += units
+                provisioned_tree_units.append(
                     {
                         "request_id": req.request_id,
                         "terminals": req.terminals,
                         "tree_id": t.tree_id,
+                        "provisioned_units": units,
                         "edges": t.edges,
                         "swap_nodes": t.swap_nodes,
                         "fusion_nodes": t.fusion_nodes,
-                        "memory": t.memory,
-                        "rho": t.rho,
-                        "expected_throughput_contribution": expected_value,
-                        "objective_contribution": expected_value,
+                        "rho_op": t.rho,
+                        "expected_operation_contribution": expected_value * units,
+                        "objective_contribution": expected_value * units,
                     }
                 )
                 served_requests.add(req.request_id)
-                for e in t.edges:
-                    routing_source_placement[e] = routing_source_placement.get(e, 0) + 1
-
-    covered_requests = [
-        req.request_id for req in requests if y[req.request_id].X > 0.5
-    ]
-    coverage_objective_term = (
-        coverage_priority_weight * len(covered_requests)
-        if objective_mode in {
-            "coverage_expected_throughput",
-            "coverage_expected_throughput_with_redundancy",
-        }
-        else 0.0
-    )
-    redundancy_objective_term = 0.0
-    if use_redundancy_reward and edge_redundancy_weight > 0:
-        for e in edges:
-            edge_reward = edge_redundancy_rewards.get(e, 0.0)
-            for k, decay in enumerate(z_decay):
-                redundancy_objective_term += (
-                    edge_redundancy_weight
-                    * edge_reward
-                    * float(decay)
-                    * float(z_increment[(e, k)].X)
-                )
 
     result["source_placement"] = source_placement
-    result["selected_trees"] = selected_trees
-    result["served_requests"] = sorted(served_requests)
-    result["covered_requests"] = covered_requests
-    redundant = allocate_redundant_source_placement(
-        selected_trees=selected_trees,
+    result["selected_trees"] = provisioned_tree_units
+    result["provisioned_tree_units"] = provisioned_tree_units
+    result["x_values"] = {
+        key: int(round(var.X))
+        for key, var in x.items()
+        if int(round(var.X)) > 0
+    }
+    feasibility_check = validate_integer_provisioning_solution(
+        graph=graph,
+        requests=requests,
+        candidate_trees=candidate_trees,
+        source_placement=source_placement,
+        x_values=result["x_values"],
         source_budget=source_budget,
         max_sources_per_edge=max_sources_per_edge,
         node_memory=node_memory,
         source_cost=source_cost,
-        candidate_trees=candidate_trees,
-        fallback_edges=fallback_edges,
-        enforce_node_memory_for_redundancy=True,
+        edge_generation_prob=edge_generation_prob,
     )
-    deployed_source_placement = (
-        redundant["routing_source_placement"]
-        if spend_remaining_budget_after_solve
-        else source_placement
-    )
-    deployed_used_budget = (
-        redundant["used_budget"]
-        if spend_remaining_budget_after_solve
-        else source_cost * sum(source_placement.values())
-    )
-    result["minimum_routing_source_placement"] = dict(sorted(routing_source_placement.items()))
-    result["routing_source_placement"] = dict(sorted(deployed_source_placement.items()))
+    result["feasibility_check"] = feasibility_check
+    result["feasible"] = feasibility_check["feasible"]
+    result["served_requests"] = sorted(served_requests)
+    result["minimum_routing_source_placement"] = dict(sorted(source_placement.items()))
+    result["routing_source_placement"] = dict(sorted(source_placement.items()))
     result["ilp_optimized_z_used_budget"] = source_cost * sum(source_placement.values())
-    result["deployed_source_count"] = sum(deployed_source_placement.values())
-    result["deployed_used_budget"] = deployed_used_budget
-    result["ilp_expected_throughput_term"] = expected_throughput_term
-    result["ilp_coverage_objective_term"] = coverage_objective_term
-    result["ilp_redundancy_objective_term"] = redundancy_objective_term
-    result["ilp_covered_requests"] = len(covered_requests)
-    result["ilp_selected_tree_count"] = len(selected_trees)
-    result["redundant_used_budget"] = redundant["used_budget"]
-    result["redundant_routing_source_placement"] = redundant["routing_source_placement"]
-    result["redundant_memory_load"] = redundant["memory_load"]
-    result["redundant_enforce_node_memory"] = True
-    result["candidate_edge_count"] = len(edge_redundancy_rewards)
-    result["effective_capacity"] = len(edge_redundancy_rewards) * max_sources_per_edge
-    result["edge_redundancy_weight"] = edge_redundancy_weight
-
+    result["deployed_source_count"] = sum(source_placement.values())
+    result["deployed_used_budget"] = source_cost * sum(source_placement.values())
+    result["ilp_operation_objective_term"] = expected_operation_term
+    result["ilp_provisioned_units"] = provisioned_unit_count
+    result["throughput_provisioned_units"] = provisioned_unit_count
+    candidate_edges = {
+        edge
+        for trees in candidate_trees.values()
+        for tree in trees
+        for edge in tree.edges
+    }
+    result["candidate_edge_count"] = len(candidate_edges)
+    result["effective_capacity"] = sum(
+        edge_generation_prob.get(edge, 0.0) * max_sources_per_edge
+        for edge in candidate_edges
+    )
     return result
 
 
@@ -1117,7 +854,6 @@ def solve_single_slot_ilp_request_batch(
     q_rem: float = 1.0,
     rho_min: float = 0.0,
     max_trees_per_request: Optional[int] = None,
-    edge_redundancy_weight: Optional[float] = None,
     master_seed: Optional[int] = None,
     time_limit: Optional[float] = None,
     mip_gap: Optional[float] = None,
@@ -1129,9 +865,9 @@ def solve_single_slot_ilp_request_batch(
     This is the ILP-side counterpart of
     run_simulator_single_slot_multi_request.py:
       - request_batch is the same list of requests used by heuristic methods.
-      - the source-placement ILP maximizes an expected per-slot throughput
-        surrogate using the same physical probability parameters as the
-        simulator.
+      - the source-placement ILP maximizes a provisioning-stage surrogate
+        objective using operation-level success probabilities and expected
+        edge-capacity constraints.
       - it does not know the actual random realization in the slot; realized
         throughput is measured later by stochastic routing/simulation.
       - all randomized candidate generation and solver randomness are derived
@@ -1163,21 +899,7 @@ def solve_single_slot_ilp_request_batch(
     if node_memory is None and node_memory_capacity is not None:
         node_memory = {v: int(node_memory_capacity) for v in topo.get_nodes()}
 
-    if max_trees_per_request is None:
-        try:
-            import single_slot_throughput_sweep_conditions as conditions
-
-            max_trees_per_request = int(conditions.ILP_MAX_TREES_PER_REQUEST)
-        except (ImportError, AttributeError):
-            max_trees_per_request = int(k_trees_per_request)
-
-    if edge_redundancy_weight is None:
-        try:
-            import single_slot_throughput_sweep_conditions as conditions
-
-            edge_redundancy_weight = float(conditions.ILP_EDGE_REDUNDANCY_WEIGHT)
-        except (ImportError, AttributeError):
-            edge_redundancy_weight = 0.05
+    del max_trees_per_request
 
     result = solve_joint_source_placement_ilp(
         graph=graph,
@@ -1187,22 +909,21 @@ def solve_single_slot_ilp_request_batch(
         max_sources_per_edge=max_sources_per_edge,
         node_memory=node_memory,
         source_cost=1,
-        allow_multiple_trees_per_request=True,
-        demand_per_request=max(1, int(max_trees_per_request)),
+        p_op=p_op,
         time_limit=time_limit,
         mip_gap=mip_gap,
         solver_seed=gurobi_seed,
-        edge_redundancy_weight=float(edge_redundancy_weight),
         verbose=verbose,
     )
 
-    result["throughput_selected_trees"] = len(result["selected_trees"])
-    result["throughput_covered_requests"] = len(result.get("covered_requests", result["served_requests"]))
-    result["throughput_qbps"] = result["throughput_covered_requests"]
+    result["throughput_selected_trees"] = result.get("throughput_provisioned_units", len(result["selected_trees"]))
+    result["throughput_covered_requests"] = len(result["served_requests"])
+    result["throughput_qbps"] = None
+    result["realized_throughput"] = None
+    result["provisioning_surrogate_objective"] = result.get("ilp_expected_objective", result["objective"] or 0.0)
     result["ilp_expected_objective"] = result.get("ilp_expected_objective", result["objective"] or 0.0)
-    result["ilp_expected_throughput_term"] = result.get("ilp_expected_throughput_term", 0.0)
-    result["ilp_covered_requests"] = result.get("ilp_covered_requests", result["throughput_covered_requests"])
-    result["ilp_selected_tree_count"] = result.get("ilp_selected_tree_count", result["throughput_selected_trees"])
+    result["ilp_operation_objective_term"] = result.get("ilp_operation_objective_term", 0.0)
+    result["ilp_provisioned_units"] = result.get("ilp_provisioned_units", result["throughput_selected_trees"])
     result["deployed_source_count"] = result.get(
         "deployed_source_count",
         sum(result.get("routing_source_placement", {}).values()),
@@ -1214,8 +935,7 @@ def solve_single_slot_ilp_request_batch(
     result["candidate_tree_counts"] = {
         req_id: len(trees) for req_id, trees in candidate_trees.items()
     }
-    result["max_trees_per_request"] = max(1, int(max_trees_per_request))
-    result["configured_edge_redundancy_weight"] = float(edge_redundancy_weight)
+    result["request_demand_bound_enabled"] = False
     return result
 
 
@@ -1225,10 +945,11 @@ def print_ilp_result(result: Dict[str, Any]) -> None:
     print("[ILP Result]")
     print("=" * 80)
     print(f"Status: {result['status_name']}")
-    print(f"ILP expected objective: {result.get('ilp_expected_objective', result['objective'])}")
-    print(f"Expected throughput term: {result.get('ilp_expected_throughput_term', 0.0)}")
-    print(f"Served requests: {result['served_requests']}")
-    print(f"Request demands D_r: {result.get('request_demands', {})}")
+    print(f"Objective mode: {result.get('objective_mode')}")
+    print(f"Operation-weighted provisioning objective: {result.get('ilp_expected_objective', result['objective'])}")
+    print(f"Provisioned service units: {result.get('throughput_provisioned_units', 0)}")
+    print(f"Requests with provisioned units: {result['served_requests']}")
+    print(f"Per-request demand bound enabled: {result.get('request_demand_bound_enabled', False)}")
 
     print("\n[Source Placement z_e]")
     if not result["source_placement"]:
@@ -1237,16 +958,17 @@ def print_ilp_result(result: Dict[str, Any]) -> None:
         for e, cnt in sorted(result["source_placement"].items()):
             print(f"  edge {e}: {cnt}")
 
-    print("\n[Selected Candidate Trees]")
+    print("\n[Provisioned Candidate Tree Units]")
     if not result["selected_trees"]:
-        print("  No tree selected.")
+        print("  No tree service unit provisioned.")
     else:
         for item in result["selected_trees"]:
             print(
                 f"  request {item['request_id']}, "
                 f"terminals={item['terminals']}, "
                 f"tree={item['tree_id']}, "
-                f"rho={item['rho']:.6e}, "
+                f"units={item.get('provisioned_units', 1)}, "
+                f"rho_op={item.get('rho_op', item.get('rho', 0.0)):.6e}, "
                 f"edges={item['edges']}, "
                 f"swap={item['swap_nodes']}, "
                 f"fusion={item['fusion_nodes']}"

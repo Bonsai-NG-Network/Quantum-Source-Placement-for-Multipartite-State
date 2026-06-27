@@ -11,20 +11,20 @@ baseline produces stable throughput trends.
 """
 
 DEFAULT_ALGORITHM_SPECS = (
-    # ("BT-SP_s", "BETWEENNESS", "singlepath_star"),
-    ("BT-MP_t", "BETWEENNESS", "multipath_tree"),
-    # ("DP-SP_s", "DP", "singlepath_star"),
-    ("DP-MP_t", "DP", "multipath_tree"),
-    # ("LP_R-SP_s", "LP_ROUND", "singlepath_star"),
-    ("LP_R-MP_t", "LP_ROUND", "multipath_tree"),
-    # ("ILP_CG-SP_s", "ILP_CG", "singlepath_star"),
-    ("ILP_CG-MP_t", "ILP_CG", "multipath_tree"),
-    # ("ILP-SP_s", "ILP", "singlepath_star"),
-    ("ILP-MP_t", "ILP", "multipath_tree"),
+    ("BT-SP_s_p", "BETWEENNESS", "singlepath_star_packing"),
+    ("BT-MP_t_p", "BETWEENNESS", "multipath_tree_packing"),
+    ("DP-SP_s_p", "DP", "singlepath_star_packing"),
+    ("DP-MP_t_p", "DP", "multipath_tree_packing"),
+    ("LP_R-SP_s_p", "LP_ROUND", "singlepath_star_packing"),
+    ("LP_R-MP_t_p", "LP_ROUND", "multipath_tree_packing"),
+    ("ILP_CG-SP_s_p", "ILP_CG", "singlepath_star_packing"),
+    ("ILP_CG-MP_t_p", "ILP_CG", "multipath_tree_packing"),
+    ("ILP-SP_s_p", "ILP", "singlepath_star_packing"),
+    ("ILP-MP_t_p", "ILP", "multipath_tree_packing"),
 )
 
 SOURCE_ORDER = ["BT", "DP", "LP_R", "ILP_CG", "ILP"]
-ROUTING_ORDER = ["SP_s", "MP_t"]
+ROUTING_ORDER = ["SP_s_p", "MP_t_p"]
 
 SOURCE_DISPLAY_LABELS = {
     "DP": "DP",
@@ -44,20 +44,23 @@ SOURCE_COLOR_PALETTE = {
 
 ROUTING_DISPLAY_LABELS = {
     "singlepath_star": "SP-s",
+    "singlepath_star_packing": "SP-s-p",
     "multipath_tree": "MP-t",
     "multipath_tree_packing": "MP-t-p",
     "MP_t": "MP-t",
+    "MP_t_p": "MP-t-p",
     "SP_s": "SP-s",
+    "SP_s_p": "SP-s-p",
 }
 
-RANDOM_SEED = 1
+RANDOM_SEED = 6
 NUM_TRIALS = 100
 RUN_RUNTIME_PLOTS = True
 SKIP_BUDGET_SWEEP = True
 RUN_EXTRA_SWEEPS = True
 NUM_USERS_PROTOCOLS_1 = 3
 NUM_REQUESTS_PER_TRIAL = 4
-OP_PROTOCOLS_1 = 0.92
+OP_PROTOCOLS_1 = 0.9
 Q_SWAP = 0.9
 Q_FUS = 0.9
 EDGE_CAPACITY = 4
@@ -74,30 +77,27 @@ WAXMAN_AREA_HEIGHT_KM = 100.0
 WAXMAN_ENSURE_CONNECTED = True
 WAXMAN_MIN_LENGTH_KM = 1.0
 WAXMAN_LENGTH_PRECISION = 2
-FIXED_BUDGET = 20
-SOURCE_BUDGETS = [10, 15, 20, 25, 30]
+FIXED_BUDGET = 50
+SOURCE_BUDGETS = [40, 50, 60, 70, 80, 90, 100]
 ILP_K_TREES = 32
-LP_ROUND_K_TREES = ILP_K_TREES
-ILP_MAX_TREES_PER_REQUEST = 4
-ILP_EDGE_REDUNDANCY_WEIGHT = 0.2
-ILP_CG_INITIAL_TREES = 4
+LP_ROUND_K_TREES = 2
+LP_ROUND_Z_THRESHOLD = 0.65
+# Retained as legacy caller metadata; the Full ILP does not impose a
+# per-request demand bound.
+ILP_MAX_TREES_PER_REQUEST = ILP_K_TREES
+ILP_CG_INITIAL_TREES = 1
 ILP_CG_PRICING_TRIALS = 4
-ILP_CG_MAX_TREES_PER_REQUEST = 4
+ILP_CG_MAX_TREES_PER_REQUEST = 2
 ILP_CG_MAX_PRICING_COLUMNS_PER_REQUEST = 2
 ILP_CG_MAX_ITERATIONS = 8
 ILP_CG_USE_NESTED_POOL = True
 ILP_CG_PRICING_MODE = "candidate_pool_exact"
 ILP_CG_PRICING_POOL_TREES = ILP_K_TREES
-# ILP source-placement objective modes:
-#   "expected_throughput"
-#   "coverage_expected_throughput"
-#   "coverage_expected_throughput_with_redundancy"
-ILP_OBJECTIVE_MODE = "coverage_expected_throughput"
-ILP_COVERAGE_PRIORITY_WEIGHT = 1000.0
-ILP_REQUEST_PRIORITY = ILP_COVERAGE_PRIORITY_WEIGHT
-ILP_USE_REDUNDANCY_REWARD = False
-ILP_SPEND_REMAINING_BUDGET_AFTER_SOLVE = True
-ILP_Z_REWARD_DECAY = [1.0, 0.95, 0.9, 0.85, 0.8, 0.75, 0.7]
+# Active ILP objective is fixed in code as REPS-style source provisioning:
+#   max sum_{r,t} rho_op[r,t] x_{r,t}
+# Coverage priority, edge-redundancy rewards, and leftover-budget
+# post-processing are disabled in the revised model.
+ILP_OBJECTIVE_MODE = "reps_source_provisioning"
 ENFORCE_THROUGHPUT_ORDER = False
 THROUGHPUT_ORDER_EPSILON = 0.02
 NO_DECOHERENCE_TIME = 10**12
@@ -107,10 +107,10 @@ DP_WEIGHT_DEMAND = 1.0
 DP_WEIGHT_QUALITY = 0.0
 DP_WEIGHT_OVERLAP = 0.0
 
-OPERATION_PROBABILITIES = [0.8, 0.85, 0.9, 0.95, 1]
-NUM_USERS_PER_REQUEST_VALUES = [3, 4, 5, 6, 7]
-QUANTUM_MEMORY_CAPACITIES = [6, 7, 8, 9, 10]
-EDGE_CAPACITIES = [3, 4, 5, 6, 7]
+OPERATION_PROBABILITIES = [0.6, 0.7, 0.8, 0.9, 1]
+NUM_USERS_PER_REQUEST_VALUES = [3, 4, 5, 6]
+QUANTUM_MEMORY_CAPACITIES = [8, 9, 10, 11]
+EDGE_CAPACITIES = [4, 5, 6, 7, 8]
 NUM_REQUESTS_PER_TRIAL_VALUES = [3, 4, 5, 6, 7]
 NETWORK_SCALES = [20, 40, 60, 80, 100]
 

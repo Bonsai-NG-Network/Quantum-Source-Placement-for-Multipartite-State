@@ -33,7 +33,7 @@ from matplotlib.patches import Patch
 
 from entanglement_link import EntanglementLink
 from event_simulator import EventSimulator
-from multipath_routing import MultipathStarRouting, MultipathTreeRouting, MultipathTreePackingRouting
+from multipath_routing import MultipathStarRouting, MultipathTreePackingRouting
 from network_request import RequestGenerator
 from network_topology import Topology
 from quantum_source_placement_all_edges_rr import AllEdgesRoundRobinSourcePlacement
@@ -453,24 +453,19 @@ def place_sources_for_batch(
         metadata = {
             "ilp_objective": ilp_result.get("objective"),
             "ilp_expected_objective": ilp_result.get("ilp_expected_objective"),
-            "ilp_expected_throughput_term": ilp_result.get("ilp_expected_throughput_term"),
-            "ilp_covered_requests": ilp_result.get("ilp_covered_requests"),
-            "ilp_selected_tree_count": ilp_result.get("ilp_selected_tree_count"),
+            "ilp_operation_objective_term": ilp_result.get("ilp_operation_objective_term"),
+            "ilp_provisioned_units": ilp_result.get("throughput_provisioned_units"),
+            "ilp_x_values": ilp_result.get("x_values"),
+            "ilp_provisioned_tree_units": ilp_result.get("provisioned_tree_units"),
+            "ilp_edge_generation_prob": ilp_result.get("edge_generation_prob"),
             "deployed_source_count": ilp_result.get("deployed_source_count"),
             "ilp_objective_mode": ilp_result.get("objective_mode"),
-            "ilp_use_redundancy_reward": ilp_result.get("use_redundancy_reward"),
-            "ilp_spend_remaining_budget_after_solve": ilp_result.get("spend_remaining_budget_after_solve"),
             "ilp_status": ilp_result.get("status_name"),
             "ilp_candidate_seed": ilp_result.get("candidate_seed"),
             "ilp_solver_seed": ilp_result.get("solver_seed"),
-            "ilp_selected_trees": ilp_result.get("throughput_selected_trees"),
             "ilp_candidate_tree_counts": ilp_result.get("candidate_tree_counts"),
-            "ilp_minimum_routing_source_placement": ilp_result.get("minimum_routing_source_placement"),
             "ilp_optimized_z_used_budget": ilp_result.get("ilp_optimized_z_used_budget"),
             "ilp_deployed_used_budget": ilp_result.get("deployed_used_budget"),
-            "ilp_redundant_used_budget": ilp_result.get("redundant_used_budget"),
-            "ilp_redundant_routing_source_placement": ilp_result.get("redundant_routing_source_placement"),
-            "ilp_redundant_memory_load": ilp_result.get("redundant_memory_load"),
             "used_budget": ilp_result.get("deployed_used_budget", ilp_result.get("ilp_optimized_z_used_budget")),
             "candidate_edge_count": ilp_result.get("candidate_edge_count"),
             "effective_capacity": ilp_result.get("effective_capacity"),
@@ -502,9 +497,9 @@ def place_sources_for_batch(
         metadata = {
             "lp_objective": lp_result.get("lp_objective"),
             "ilp_expected_objective": lp_result.get("ilp_expected_objective"),
-            "ilp_expected_throughput_term": lp_result.get("ilp_expected_throughput_term"),
-            "ilp_covered_requests": lp_result.get("ilp_covered_requests"),
-            "ilp_selected_tree_count": lp_result.get("ilp_selected_tree_count"),
+            "ilp_operation_objective_term": lp_result.get("ilp_operation_objective_term"),
+            "ilp_provisioned_units": lp_result.get("throughput_selected_trees"),
+            "ilp_provisioned_tree_units": lp_result.get("provisioned_tree_units"),
             "deployed_source_count": lp_result.get("deployed_source_count"),
             "ilp_objective_mode": lp_result.get("objective_mode"),
             "lp_status": lp_result.get("status_name"),
@@ -552,13 +547,13 @@ def place_sources_for_batch(
         metadata = {
             "ilp_objective": ilp_result.get("objective"),
             "ilp_expected_objective": ilp_result.get("ilp_expected_objective"),
-            "ilp_expected_throughput_term": ilp_result.get("ilp_expected_throughput_term"),
-            "ilp_covered_requests": ilp_result.get("ilp_covered_requests"),
-            "ilp_selected_tree_count": ilp_result.get("ilp_selected_tree_count"),
+            "ilp_operation_objective_term": ilp_result.get("ilp_operation_objective_term"),
+            "ilp_provisioned_units": ilp_result.get("throughput_provisioned_units"),
+            "ilp_x_values": ilp_result.get("x_values"),
+            "ilp_provisioned_tree_units": ilp_result.get("provisioned_tree_units"),
+            "ilp_edge_generation_prob": ilp_result.get("edge_generation_prob"),
             "deployed_source_count": ilp_result.get("deployed_source_count"),
             "ilp_objective_mode": ilp_result.get("objective_mode"),
-            "ilp_use_redundancy_reward": ilp_result.get("use_redundancy_reward"),
-            "ilp_spend_remaining_budget_after_solve": ilp_result.get("spend_remaining_budget_after_solve"),
             "ilp_status": ilp_result.get("status_name"),
             "ilp_cg_iterations": ilp_result.get("cg_iterations"),
             "ilp_cg_added_columns": ilp_result.get("cg_added_columns"),
@@ -569,14 +564,9 @@ def place_sources_for_batch(
             "ilp_cg_final_solver_seed": ilp_result.get("cg_final_solver_seed"),
             "ilp_cg_max_trees_per_request": ilp_result.get("cg_max_trees_per_request"),
             "ilp_cg_max_pricing_columns_per_request": ilp_result.get("cg_max_pricing_columns_per_request"),
-            "ilp_selected_trees": ilp_result.get("throughput_selected_trees"),
             "ilp_candidate_tree_counts": ilp_result.get("candidate_tree_counts"),
-            "ilp_minimum_routing_source_placement": ilp_result.get("minimum_routing_source_placement"),
             "ilp_optimized_z_used_budget": ilp_result.get("ilp_optimized_z_used_budget"),
             "ilp_deployed_used_budget": ilp_result.get("deployed_used_budget"),
-            "ilp_redundant_used_budget": ilp_result.get("redundant_used_budget"),
-            "ilp_redundant_routing_source_placement": ilp_result.get("redundant_routing_source_placement"),
-            "ilp_redundant_memory_load": ilp_result.get("redundant_memory_load"),
             "used_budget": ilp_result.get("deployed_used_budget", ilp_result.get("ilp_optimized_z_used_budget")),
             "candidate_edge_count": ilp_result.get("candidate_edge_count"),
             "effective_capacity": ilp_result.get("effective_capacity"),
@@ -631,13 +621,13 @@ def run_request_once_in_current_slot(
     user_set = list(user_set)
     no_new_links = {}
 
-    if method_key in {"pr", "singlepath_star"}:
+    if method_key in {"pr", "singlepath_star", "singlepath_star_packing", "sp_s_p"}:
         vc, _ = simulator.select_center_node(user_set, edge_probs, deployed_dict)
         if vc is None:
             return 0
         paths = simulator.get_shortest_paths_SP(vc, user_set)
         routing = SPEntanglementRouting(simulator.network, user_set, simulator.p_op)
-        time_to_success, num_ghz = routing.singlepath_star_routing(
+        time_to_success, num_ghz = routing.singlepath_star_packing_routing(
             vc,
             paths,
             max_timeslot=2,
@@ -669,15 +659,7 @@ def run_request_once_in_current_slot(
         )
         return 1 if time_to_success else 0
 
-    if method_key in {"mpc", "multipath_tree"}:
-        routing = MultipathTreeRouting(simulator.network, user_set, simulator.p_op, q_swap=q_swap, q_fus=q_fus)
-        time_to_success = routing.multipath_tree_routing(
-            max_timeslot=1,
-            deployed_sources=no_new_links,
-        )
-        return 1 if time_to_success else 0
-
-    if method_key in {"rr", "mpp", "multipath_tree_packing"}:
+    if method_key in {"mpc", "multipath_tree", "rr", "mpp", "multipath_tree_packing", "mp_t_p"}:
         routing = MultipathTreePackingRouting(simulator.network, user_set, simulator.p_op, q_swap=q_swap, q_fus=q_fus)
         time_to_success, num_ghz = routing.multipath_tree_packing_routing(
             max_timeslot=1,
@@ -815,9 +797,11 @@ def run_algorithm_on_single_slot_batch(
         "candidate_edge_count": candidate_edge_count,
         "effective_capacity": effective_capacity,
         "ilp_expected_objective": source_metadata.get("ilp_expected_objective", ""),
-        "ilp_expected_throughput_term": source_metadata.get("ilp_expected_throughput_term", ""),
-        "ilp_covered_requests": source_metadata.get("ilp_covered_requests", ""),
-        "ilp_selected_tree_count": source_metadata.get("ilp_selected_tree_count", ""),
+        "ilp_operation_objective_term": source_metadata.get("ilp_operation_objective_term", ""),
+        "ilp_provisioned_units": source_metadata.get("ilp_provisioned_units", ""),
+        "ilp_x_values": source_metadata.get("ilp_x_values", ""),
+        "ilp_provisioned_tree_units": source_metadata.get("ilp_provisioned_tree_units", ""),
+        "ilp_edge_generation_prob": source_metadata.get("ilp_edge_generation_prob", ""),
         "placement_runtime": placement_runtime,
         "link_deployment_runtime": link_deployment_runtime,
         "routing_runtime": routing_runtime,
@@ -962,9 +946,11 @@ def evaluate_algorithms(
                     "realized_throughput": result["realized_throughput"],
                     "realized_successful_ghz_count": result["realized_successful_ghz_count"],
                     "ilp_expected_objective": result["ilp_expected_objective"],
-                    "ilp_expected_throughput_term": result["ilp_expected_throughput_term"],
-                    "ilp_covered_requests": result["ilp_covered_requests"],
-                    "ilp_selected_tree_count": result["ilp_selected_tree_count"],
+                    "ilp_operation_objective_term": result["ilp_operation_objective_term"],
+                    "ilp_provisioned_units": result["ilp_provisioned_units"],
+                    "ilp_x_values": str(result["ilp_x_values"]),
+                    "ilp_provisioned_tree_units": str(result["ilp_provisioned_tree_units"]),
+                    "ilp_edge_generation_prob": str(result["ilp_edge_generation_prob"]),
                     "deployed_source_count": result["deployed_source_count"],
                     "served_requests": result["served_requests"],
                     "failed_requests": result["failed_requests"],
@@ -1009,9 +995,11 @@ def evaluate_algorithms(
                 "realized_throughput": mean,
                 "realized_successful_ghz_count": mean,
                 "ilp_expected_objective": "",
-                "ilp_expected_throughput_term": "",
-                "ilp_covered_requests": "",
-                "ilp_selected_tree_count": "",
+                "ilp_operation_objective_term": "",
+                "ilp_provisioned_units": "",
+                "ilp_x_values": "",
+                "ilp_provisioned_tree_units": "",
+                "ilp_edge_generation_prob": "",
                 "deployed_source_count": "",
                 "served_requests": "",
                 "failed_requests": "",
@@ -1286,7 +1274,7 @@ def source_color_map(sources: Sequence[str]):
 
 
 def routing_bar_style(routing: str) -> Dict[str, Any]:
-    if routing == "SP_s":
+    if routing in {"SP_s", "SP_s_p"}:
         return {"hatch": "////", "face_alpha": 0.16, "linewidth": 0.95}
     return {"hatch": None, "face_alpha": 0.82, "linewidth": 0.55}
 

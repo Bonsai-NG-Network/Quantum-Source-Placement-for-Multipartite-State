@@ -1,20 +1,22 @@
 """
 LP relaxation + rounding baseline for ILP source placement.
 
-This module keeps the same candidate-tree-based source placement model as the
-full ILP, but relaxes x_{r,t} from binary to continuous variables:
+This module keeps the same REPS-style source provisioning model as the full
+ILP, but relaxes x_{r,t} and z_e to continuous variables:
 
-    0 <= x_{r,t} <= 1
+    x_{r,t} >= 0
+    0 <= z_e <= Z_e^max
 
-The fractional LP solution is rounded into selected trees, and the selected
-trees are converted into a source placement. The output is still only a source
-placement; entanglement routing, swapping, and fusion are performed later by
-the simulator.
+LP-R keeps z_e in the LP relaxation, then rounds tree-service provisioning
+variables first. The integer source placement is derived from rounded edge
+demand by z_e = ceil(d_e / p_e). Entanglement routing, swapping, and fusion are
+performed later by the simulator.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 try:
@@ -29,15 +31,13 @@ from ilp_multipartite_source_placement import (
     GUROBI_SEED_MAX,
     CandidateTree,
     MultipartiteRequest,
-    allocate_redundant_source_placement,
-    build_batch_user_path_edges,
+    build_edge_generation_probabilities,
     build_candidate_trees_for_requests,
-    ilp_objective_mode,
     norm_edge,
     requests_from_user_sets,
-    served_request_priority,
     status_to_string,
     tree_expected_throughput_value,
+    validate_integer_provisioning_solution,
 )
 from network_topology import Topology
 from seed_utils import derive_seed, set_global_seed
@@ -51,10 +51,11 @@ class LPRelaxationResult:
     status: int
     status_name: str
     objective: float
-    expected_throughput_term: float
+    operation_objective_term: float
     objective_mode: str
     x_values: Dict[Tuple[int, int], float]
     z_values: Dict[Edge, float]
+    edge_generation_prob: Dict[Edge, float]
     model: Any
 
 
@@ -67,9 +68,11 @@ def solve_source_placement_lp_relaxation(
     node_memory: Optional[Dict[Any, int]] = None,
     source_cost: int = 1,
     max_trees_per_request: int = 1,
+    p_op: float = 0.8,
     solver_seed: Optional[int] = None,
     verbose: bool = False,
 ) -> LPRelaxationResult:
+    del max_trees_per_request
     edges = sorted(norm_edge(u, v) for u, v in graph.edges())
     nodes = sorted(graph.nodes())
 
@@ -82,10 +85,9 @@ def solve_source_placement_lp_relaxation(
     if solver_seed is not None:
         model.Params.Seed = int(solver_seed) % GUROBI_SEED_MAX
 
-    max_trees_per_request = max(1, int(max_trees_per_request))
+    edge_generation_prob = build_edge_generation_probabilities(graph, edges, p_op=p_op)
 
     x = {}
-    y = {}
     z = {
         edge: model.addVar(
             lb=0.0,
@@ -96,66 +98,27 @@ def solve_source_placement_lp_relaxation(
         for edge in edges
     }
     for req in requests:
-        y[req.request_id] = model.addVar(
-            lb=0.0,
-            ub=1.0,
-            vtype=GRB.CONTINUOUS,
-            name=f"y_r{req.request_id}",
-        )
         for tree in candidate_trees.get(req.request_id, []):
             x[(req.request_id, tree.tree_id)] = model.addVar(
                 lb=0.0,
-                ub=1.0,
                 vtype=GRB.CONTINUOUS,
                 name=f"x_r{req.request_id}_t{tree.tree_id}",
             )
 
     model.update()
-    objective_mode = ilp_objective_mode()
-    if objective_mode not in {
-        "expected_throughput",
-        "coverage_expected_throughput",
-        "coverage_expected_throughput_with_redundancy",
-    }:
-        raise ValueError(f"Unsupported ILP objective_mode={objective_mode!r}.")
+    objective_mode = "reps_source_provisioning_lp_relaxation"
 
-    coverage_terms = []
-    if objective_mode in {
-        "coverage_expected_throughput",
-        "coverage_expected_throughput_with_redundancy",
-    }:
-        request_priority = served_request_priority(candidate_trees)
-        coverage_terms = [
-            request_priority * y[req.request_id]
-            for req in requests
-        ]
-
-    # LP-rounding uses the same expected-throughput surrogate as the full ILP,
-    # with x and y relaxed to continuous variables. The ILP probabilities are
-    # expected values; realized throughput is sampled later by the simulator.
+    # LP-rounding relaxes the REPS source-provisioning model. Edge generation
+    # probability appears only in the expected edge-capacity constraints.
     expected_terms = [
         tree_expected_throughput_value(req, tree) * x[(req.request_id, tree.tree_id)]
         for req in requests
         for tree in candidate_trees.get(req.request_id, [])
     ]
     model.setObjective(
-        gp.quicksum(coverage_terms + expected_terms),
+        gp.quicksum(expected_terms),
         GRB.MAXIMIZE,
     )
-
-    for req in requests:
-        selected_for_request = gp.quicksum(
-            x[(req.request_id, tree.tree_id)]
-            for tree in candidate_trees.get(req.request_id, [])
-        )
-        model.addConstr(
-            selected_for_request >= y[req.request_id],
-            name=f"request_coverage_lower_r{req.request_id}",
-        )
-        model.addConstr(
-            selected_for_request <= max_trees_per_request * y[req.request_id],
-            name=f"request_tree_limit_r{req.request_id}",
-        )
 
     for edge in edges:
         selected_edge_load = gp.quicksum(
@@ -165,12 +128,8 @@ def solve_source_placement_lp_relaxation(
             if edge in tree.edges
         )
         model.addConstr(
-            selected_edge_load <= z[edge],
-            name=f"edge_{edge[0]}_{edge[1]}",
-        )
-        model.addConstr(
-            z[edge] <= selected_edge_load,
-            name=f"edge_source_exact_without_redundancy_{edge[0]}_{edge[1]}",
+            selected_edge_load <= edge_generation_prob[edge] * z[edge],
+            name=f"expected_edge_capacity_{edge[0]}_{edge[1]}",
         )
 
     model.addConstr(
@@ -185,21 +144,12 @@ def solve_source_placement_lp_relaxation(
     for node in nodes:
         model.addConstr(
             gp.quicksum(
-                tree.memory.get(node, 0) * x[(req.request_id, tree.tree_id)]
-                for req in requests
-                for tree in candidate_trees.get(req.request_id, [])
-            )
-            <= int(node_memory.get(node, 0)),
-            name=f"memory_{node}",
-        )
-        model.addConstr(
-            gp.quicksum(
                 z[edge]
                 for edge in edges
                 if node in edge
             )
             <= int(node_memory.get(node, 0)),
-            name=f"memory_source_placement_{node}",
+            name=f"node_memory_{node}",
         )
 
     model.optimize()
@@ -209,14 +159,15 @@ def solve_source_placement_lp_relaxation(
             status=status,
             status_name=status_to_string(status),
             objective=0.0,
-            expected_throughput_term=0.0,
+            operation_objective_term=0.0,
             objective_mode=objective_mode,
             x_values={},
             z_values={},
+            edge_generation_prob=edge_generation_prob,
             model=model,
         )
 
-    expected_throughput_term = sum(
+    operation_objective_term = sum(
         tree_expected_throughput_value(req, tree)
         * float(x[(req.request_id, tree.tree_id)].X)
         for req in requests
@@ -226,10 +177,11 @@ def solve_source_placement_lp_relaxation(
         status=status,
         status_name=status_to_string(status),
         objective=float(model.ObjVal),
-        expected_throughput_term=float(expected_throughput_term),
+        operation_objective_term=float(operation_objective_term),
         objective_mode=objective_mode,
         x_values={key: float(var.X) for key, var in x.items()},
         z_values={edge: float(var.X) for edge, var in z.items()},
+        edge_generation_prob=edge_generation_prob,
         model=model,
     )
 
@@ -238,148 +190,182 @@ def round_lp_solution_to_source_placement(
     requests: List[MultipartiteRequest],
     candidate_trees: Dict[int, List[CandidateTree]],
     x_values: Dict[Tuple[int, int], float],
+    z_values: Dict[Edge, float],
+    edge_generation_prob: Dict[Edge, float],
+    graph,
     source_budget: int,
     max_sources_per_edge: int = 5,
     node_memory: Optional[Dict[Any, int]] = None,
     source_cost: int = 1,
     max_trees_per_request: int = 1,
-    fallback_edges: Optional[Iterable[Edge]] = None,
     epsilon: float = 1e-9,
 ) -> Dict[str, Any]:
+    del max_trees_per_request, z_values
     if node_memory is None:
         nodes = {
-            node
-            for trees in candidate_trees.values()
-            for tree in trees
-            for node in tree.memory
+            endpoint
+            for edge in edge_generation_prob
+            for endpoint in edge
         }
         node_memory = {v: 10**6 for v in nodes}
 
-    candidate_items = []
+    edges = sorted(edge_generation_prob)
+    tree_lookup = {
+        (req.request_id, tree.tree_id): (req, tree)
+        for req in requests
+        for tree in candidate_trees.get(req.request_id, [])
+    }
+    x_int: Dict[Tuple[int, int], int] = {key: 0 for key in tree_lookup}
+    edge_demand: Dict[Edge, int] = {edge: 0 for edge in edges}
+
+    def compute_source_placement(demand: Dict[Edge, int]) -> Optional[Dict[Edge, int]]:
+        placement: Dict[Edge, int] = {}
+        for edge in edges:
+            d_e = int(demand.get(edge, 0))
+            if d_e <= 0:
+                continue
+            p_e = float(edge_generation_prob.get(edge, 0.0))
+            if p_e <= 0.0:
+                return None
+            placement[edge] = int(math.ceil((d_e - 1e-12) / p_e))
+        return placement
+
+    def feasibility_for(demand: Dict[Edge, int], x_candidate: Dict[Tuple[int, int], int]) -> Tuple[bool, Dict[str, Any]]:
+        placement = compute_source_placement(demand)
+        if placement is None:
+            return False, {"feasible": False, "violations": ["positive demand on an edge with p_e=0"]}
+        check = validate_integer_provisioning_solution(
+            graph=graph,
+            requests=requests,
+            candidate_trees=candidate_trees,
+            source_placement=placement,
+            x_values={key: value for key, value in x_candidate.items() if value > 0},
+            source_budget=source_budget,
+            max_sources_per_edge=max_sources_per_edge,
+            node_memory=node_memory,
+            source_cost=source_cost,
+            edge_generation_prob=edge_generation_prob,
+        )
+        return bool(check["feasible"]), check
+
+    def additional_source_requirement(tree: CandidateTree, demand: Dict[Edge, int]) -> int:
+        before = compute_source_placement(demand) or {}
+        tentative = dict(demand)
+        for edge in tree.edges:
+            tentative[edge] = tentative.get(edge, 0) + 1
+        after = compute_source_placement(tentative)
+        if after is None:
+            return 10**12
+        return sum(after.values()) - sum(before.values())
+
+    candidates = []
     for req in requests:
         for tree in candidate_trees.get(req.request_id, []):
             value = x_values.get((req.request_id, tree.tree_id), 0.0)
             if value <= epsilon:
                 continue
-            candidate_items.append((req, tree, value))
+            candidates.append(
+                {
+                    "key": (req.request_id, tree.tree_id),
+                    "request": req,
+                    "tree": tree,
+                    "lp_value": float(value),
+                    "floor_units": int(math.floor(float(value) + epsilon)),
+                    "fractional": float(value) - math.floor(float(value) + epsilon),
+                }
+            )
 
-    candidate_items.sort(
+    candidates.sort(
         key=lambda item: (
-            -(item[2] * tree_expected_throughput_value(item[0], item[1])),
-            len(item[1].edges),
-            -item[1].rho,
-            item[0].request_id,
-            item[1].tree_id,
+            -item["lp_value"] * tree_expected_throughput_value(item["request"], item["tree"]),
+            -tree_expected_throughput_value(item["request"], item["tree"]),
+            len(item["tree"].edges),
+            additional_source_requirement(item["tree"], edge_demand),
+            item["request"].request_id,
+            item["tree"].tree_id,
         )
     )
 
-    max_trees_per_request = max(1, int(max_trees_per_request))
-    selected_tree_keys = set()
-    selected_trees = []
+    last_check: Dict[str, Any] = {
+        "feasible": True,
+        "violations": [],
+        "used_budget": 0,
+        "edge_demand": dict(edge_demand),
+        "node_memory_load": {},
+    }
+
+    def try_add_service_unit(item: Dict[str, Any]) -> bool:
+        nonlocal edge_demand, last_check
+        key = item["key"]
+        tree = item["tree"]
+        tentative_x = dict(x_int)
+        tentative_demand = dict(edge_demand)
+        tentative_x[key] = tentative_x.get(key, 0) + 1
+        for edge in tree.edges:
+            tentative_demand[edge] = tentative_demand.get(edge, 0) + 1
+        feasible, check = feasibility_for(tentative_demand, tentative_x)
+        last_check = check
+        if not feasible:
+            return False
+        x_int[key] = tentative_x[key]
+        edge_demand = tentative_demand
+        return True
+
+    for item in candidates:
+        for _ in range(max(0, int(item["floor_units"]))):
+            try_add_service_unit(item)
+
+    for item in candidates:
+        if item["fractional"] > epsilon:
+            try_add_service_unit(item)
+
+    source_placement = compute_source_placement(edge_demand) or {}
+    feasible, final_check = feasibility_for(edge_demand, x_int)
+    last_check = final_check
+
+    provisioned_units = []
     served_requests = set()
-    selected_count_by_request: Dict[int, int] = {}
-    edge_load: Dict[Edge, int] = {}
-    memory_load: Dict[Any, int] = {}
-    source_memory_load: Dict[Any, int] = {}
-    used_budget = 0
-
-    def try_select(req: MultipartiteRequest, tree: CandidateTree, value: float) -> bool:
-        nonlocal used_budget
-        tree_key = (req.request_id, tree.tree_id)
-        if tree_key in selected_tree_keys:
-            return False
-        if selected_count_by_request.get(req.request_id, 0) >= max_trees_per_request:
-            return False
-        tree_budget = source_cost * len(tree.edges)
-        if used_budget + tree_budget > source_budget:
-            return False
-
-        violates_edge = any(
-            edge_load.get(edge, 0) + 1 > max_sources_per_edge
-            for edge in tree.edges
-        )
-        if violates_edge:
-            return False
-
-        violates_memory = any(
-            memory_load.get(node, 0) + amount > int(node_memory.get(node, 0))
-            for node, amount in tree.memory.items()
-        )
-        if violates_memory:
-            return False
-
-        tree_source_memory: Dict[Any, int] = {}
-        for edge in tree.edges:
-            u, v = edge
-            tree_source_memory[u] = tree_source_memory.get(u, 0) + 1
-            tree_source_memory[v] = tree_source_memory.get(v, 0) + 1
-        violates_source_memory = any(
-            source_memory_load.get(node, 0) + amount > int(node_memory.get(node, 0))
-            for node, amount in tree_source_memory.items()
-        )
-        if violates_source_memory:
-            return False
-
-        selected_tree_keys.add(tree_key)
-        selected_count_by_request[req.request_id] = selected_count_by_request.get(req.request_id, 0) + 1
+    rounded_objective = 0.0
+    for key, units in sorted(x_int.items()):
+        if units <= 0:
+            continue
+        req, tree = tree_lookup[key]
         served_requests.add(req.request_id)
-        used_budget += tree_budget
-
-        for edge in tree.edges:
-            edge_load[edge] = edge_load.get(edge, 0) + 1
-        for node, amount in tree_source_memory.items():
-            source_memory_load[node] = source_memory_load.get(node, 0) + amount
-        for node, amount in tree.memory.items():
-            memory_load[node] = memory_load.get(node, 0) + amount
-
-        selected_trees.append(
+        contribution = tree_expected_throughput_value(req, tree) * units
+        rounded_objective += contribution
+        provisioned_units.append(
             {
                 "request_id": req.request_id,
                 "terminals": req.terminals,
                 "tree_id": tree.tree_id,
+                "provisioned_units": units,
                 "edges": tree.edges,
                 "swap_nodes": tree.swap_nodes,
                 "fusion_nodes": tree.fusion_nodes,
-                "memory": tree.memory,
-                "rho": tree.rho,
-                "lp_value": value,
+                "rho_op": tree.rho,
+                "lp_value": x_values.get(key, 0.0),
+                "objective_contribution": contribution,
             }
         )
-        return True
 
-    for req in requests:
-        for item_req, tree, value in candidate_items:
-            if item_req.request_id == req.request_id and try_select(item_req, tree, value):
-                break
-
-    for req, tree, value in candidate_items:
-        try_select(req, tree, value)
-
-    redundant = allocate_redundant_source_placement(
-        selected_trees=selected_trees,
-        source_budget=source_budget,
-        max_sources_per_edge=max_sources_per_edge,
-        node_memory=node_memory,
-        source_cost=source_cost,
-        candidate_trees=candidate_trees,
-        fallback_edges=fallback_edges,
-        enforce_node_memory_for_redundancy=True,
-    )
-
+    used_budget = source_cost * sum(source_placement.values())
     return {
-        "routing_source_placement": redundant["routing_source_placement"],
-        "minimum_routing_source_placement": dict(sorted(edge_load.items())),
-        "source_placement": redundant["routing_source_placement"],
-        "selected_trees": selected_trees,
+        "routing_source_placement": dict(sorted(source_placement.items())),
+        "minimum_routing_source_placement": dict(sorted(source_placement.items())),
+        "source_placement": dict(sorted(source_placement.items())),
+        "selected_trees": provisioned_units,
+        "provisioned_tree_units": provisioned_units,
+        "x_values": {key: value for key, value in x_int.items() if value > 0},
         "served_requests": sorted(served_requests),
         "minimum_used_budget": used_budget,
-        "used_budget": redundant["used_budget"],
-        "memory_load": redundant["memory_load"],
-        "minimum_memory_load": memory_load,
-        "minimum_source_memory_load": source_memory_load,
-        "redundant_enforce_node_memory": True,
-        "candidate_edge_count": redundant["candidate_edge_count"],
-        "effective_capacity": redundant["effective_capacity"],
+        "used_budget": used_budget,
+        "memory_load": last_check.get("node_memory_load", {}),
+        "candidate_edge_count": len(source_placement),
+        "effective_capacity": sum(edge_generation_prob.get(edge, 0.0) * max_sources_per_edge for edge in source_placement),
+        "edge_demand": dict(edge_demand),
+        "rounded_integer_objective": rounded_objective,
+        "rounding_feasible": bool(feasible),
+        "feasibility_check": last_check,
     }
 
 
@@ -436,7 +422,7 @@ def solve_single_slot_lp_rounding_request_batch(
         max_sources_per_edge=max_sources_per_edge,
         node_memory=node_memory,
         source_cost=1,
-        max_trees_per_request=max(1, int(k_trees_per_request)),
+        p_op=p_op,
         solver_seed=lp_solver_seed,
         verbose=verbose,
     )
@@ -445,12 +431,13 @@ def solve_single_slot_lp_rounding_request_batch(
         requests=requests,
         candidate_trees=candidate_trees,
         x_values=lp_result.x_values,
+        z_values=lp_result.z_values,
+        edge_generation_prob=lp_result.edge_generation_prob,
+        graph=graph,
         source_budget=source_budget,
         max_sources_per_edge=max_sources_per_edge,
         node_memory=node_memory,
         source_cost=1,
-        max_trees_per_request=max(1, int(k_trees_per_request)),
-        fallback_edges=build_batch_user_path_edges(graph, requests),
     )
 
     result = {
@@ -458,28 +445,41 @@ def solve_single_slot_lp_rounding_request_batch(
         "status_name": lp_result.status_name,
         "objective": lp_result.objective,
         "lp_objective": lp_result.objective,
-        "ilp_expected_objective": lp_result.objective,
-        "ilp_expected_throughput_term": lp_result.expected_throughput_term,
-        "ilp_covered_requests": len(rounded["served_requests"]),
-        "ilp_selected_tree_count": len(rounded["selected_trees"]),
+        "rounded_integer_objective": rounded["rounded_integer_objective"],
+        "ilp_expected_objective": rounded["rounded_integer_objective"],
+        "ilp_operation_objective_term": lp_result.operation_objective_term,
+        "ilp_provisioned_units": sum(item.get("provisioned_units", 1) for item in rounded["selected_trees"]),
         "deployed_source_count": sum(rounded["source_placement"].values()),
         "objective_mode": lp_result.objective_mode,
         "x_values": lp_result.x_values,
+        "rounded_x_values": rounded["x_values"],
+        "edge_generation_prob": lp_result.edge_generation_prob,
         "source_placement": rounded["source_placement"],
         "routing_source_placement": rounded["routing_source_placement"],
         "selected_trees": rounded["selected_trees"],
+        "provisioned_tree_units": rounded["provisioned_tree_units"],
         "served_requests": rounded["served_requests"],
         "used_budget": rounded["used_budget"],
         "memory_load": rounded["memory_load"],
         "candidate_edge_count": rounded["candidate_edge_count"],
         "effective_capacity": rounded["effective_capacity"],
-        "throughput_qbps": len(rounded["served_requests"]),
-        "throughput_selected_trees": len(rounded["selected_trees"]),
+        "feasibility_check": rounded["feasibility_check"],
+        "rounding_feasible": rounded["rounding_feasible"],
+        "lp_rounding_note": (
+            "LP-R solves the REPS LP relaxation and rounds service units first; "
+            "the rounded integer solution is feasible when feasibility_check.feasible is true, "
+            "but it is not guaranteed optimal."
+        ),
+        "throughput_qbps": None,
+        "realized_throughput": None,
+        "provisioning_surrogate_objective": rounded["rounded_integer_objective"],
+        "throughput_selected_trees": sum(item.get("provisioned_units", 1) for item in rounded["selected_trees"]),
         "throughput_covered_requests": len(rounded["served_requests"]),
         "request_batch": [list(req) for req in request_batch],
         "master_seed": master_seed,
         "candidate_seed": candidate_seed,
         "solver_seed": None if lp_solver_seed is None else int(lp_solver_seed) % GUROBI_SEED_MAX,
+        "request_demand_bound_enabled": False,
         "candidate_tree_counts": {
             req_id: len(trees) for req_id, trees in candidate_trees.items()
         },
@@ -515,7 +515,7 @@ def main() -> None:
     print("LP relaxation + rounding test passed.")
     print(f"Status: {result['status_name']}")
     print(f"LP expected objective: {result['lp_objective']}")
-    print(f"Selected trees: {result['throughput_selected_trees']}")
+    print(f"Provisioned service units: {result['throughput_selected_trees']}")
     print(f"Routing source placement: {result['routing_source_placement']}")
 
 

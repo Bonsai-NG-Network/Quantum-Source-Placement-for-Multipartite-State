@@ -142,8 +142,81 @@ class SPEntanglementRouting:
 
         return time_slot, num_ghz_in_slot
 
+    def _active_link_count(self, u, v, current_time):
+        self.link_manager.purge_expired_links(current_time)
+        return sum(
+            1
+            for link in self.link_manager.links
+            if len(link.nodes) == 2 and u in link.nodes and v in link.nodes
+        )
+
+    def _star_paths_available(self, paths, current_time):
+        if not paths:
+            return False
+        for path in paths.values():
+            if len(path) < 2:
+                return False
+            for idx in range(len(path) - 1):
+                if self._active_link_count(path[idx], path[idx + 1], current_time) <= 0:
+                    return False
+        return True
+
+    def _star_tree_capacity(self, star_tree, current_time):
+        edge_counts = [
+            self._active_link_count(u, v, current_time)
+            for u, v in star_tree.edges()
+        ]
+        if not edge_counts:
+            return 0
+        return min(edge_counts)
+
+    def singlepath_star_packing_routing(self, vc, paths, max_timeslot, deployed_sources, q_swap=1.0, q_fus=1.0):
+        time_slot = 0
+        hasGHZ = False
+        num_ghz_in_slot = 0
+        star_tree = build_tree_from_paths(paths)
+        plan = build_tree_operation_plan(
+            star_tree,
+            self.user_set,
+            p_op=self.p_op,
+            q_swap=q_swap,
+            q_fus=q_fus,
+            forced_fusion_nodes=[vc],
+        )
+
+        while not hasGHZ:
+            time_slot += 1
+            print("\n")
+            print(f"[SinglePathStarPacking] [Time slot {time_slot}]")
+            if time_slot >= max_timeslot:
+                if num_ghz_in_slot == 0:
+                    time_slot = 0
+                break
+
+            self.network.purge_all_expired(time_slot)
+            self.simulate_entanglement_links(deployed_sources, time_slot)
+
+            attempts = 0
+            max_attempts = self._star_tree_capacity(star_tree, time_slot)
+            while attempts < max_attempts and self._star_paths_available(paths, time_slot):
+                attempts += 1
+                success = execute_tree_operation_plan(
+                    self.swapping,
+                    self.fusion,
+                    plan,
+                    current_time=time_slot,
+                    q_swap=q_swap,
+                    q_fus=q_fus,
+                )
+                if success:
+                    print(f"[Fusion] GHZ generated at vc={vc}, (Packing #{num_ghz_in_slot + 1})")
+                    num_ghz_in_slot += 1
+                    hasGHZ = True
+
+        return time_slot, num_ghz_in_slot
+
     def sp_routing(self, vc, paths, max_timeslot, deployed_sources):
-        return self.singlepath_star_routing(vc, paths, max_timeslot, deployed_sources)
+        return self.singlepath_star_packing_routing(vc, paths, max_timeslot, deployed_sources)
 
     def singlepath_tree_routing(
         self,
@@ -273,7 +346,7 @@ def main():
         "B": ["E", "B"],
         "C": ["E", "C"],
     }
-    final_time, num_ghz = router.singlepath_star_routing(
+    final_time, num_ghz = router.singlepath_star_packing_routing(
         vc="E",
         paths=paths,
         max_timeslot=4,
@@ -283,6 +356,25 @@ def main():
     )
     assert final_time > 0
     assert num_ghz > 0
+
+    net = QuantumNetwork(edge_list=edge_list, max_per_edge=3, decoherence_time=10)
+    router = SPEntanglementRouting(net, users, p_op=1.0)
+    deployed_packing = {
+        tuple(sorted(("A", "X"))): 2,
+        tuple(sorted(("X", "E"))): 2,
+        tuple(sorted(("E", "B"))): 2,
+        tuple(sorted(("E", "C"))): 2,
+    }
+    final_time, num_ghz = router.singlepath_star_packing_routing(
+        vc="E",
+        paths=paths,
+        max_timeslot=4,
+        deployed_sources=deployed_packing,
+        q_swap=1.0,
+        q_fus=1.0,
+    )
+    assert final_time > 0
+    assert num_ghz == 2
 
     net = QuantumNetwork(edge_list=edge_list, max_per_edge=2, decoherence_time=10)
     router = SPEntanglementRouting(net, users, p_op=1.0)
@@ -299,7 +391,7 @@ def main():
 
     net = QuantumNetwork(edge_list=edge_list, max_per_edge=2, decoherence_time=10)
     router = SPEntanglementRouting(net, users, p_op=1.0)
-    final_time, num_ghz = router.singlepath_star_routing(
+    final_time, num_ghz = router.singlepath_star_packing_routing(
         vc="E",
         paths=paths,
         max_timeslot=3,

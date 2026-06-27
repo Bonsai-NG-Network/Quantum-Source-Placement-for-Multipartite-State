@@ -243,6 +243,12 @@ class MultipathTreePackingRouting:
             self.simulate_entanglement_links(deployed_sources, time_slot)
 
             G_prime = self.link_manager.get_subgraph(current_time=time_slot)
+            attempts = 0
+            max_attempts = sum(
+                1
+                for link in self.link_manager.links
+                if len(link.nodes) == 2
+            )
 
             # print(
             #     f"[MPP] Time {time_slot}, subgraph nodes: {list(G_prime.nodes())}, edges: {list(G_prime.edges(data=True))}")
@@ -255,7 +261,8 @@ class MultipathTreePackingRouting:
             # plt.tight_layout()
             # plt.show()
 
-            while has_connecting_tree(G_prime, self.user_set):
+            while attempts < max_attempts and has_connecting_tree(G_prime, self.user_set):
+                attempts += 1
                 R = approximate_steiner_tree(G_prime, self.user_set)
                 plan = build_tree_operation_plan(R, self.user_set, p_op=1.0, q_swap=self.q_swap, q_fus=self.q_fus)
 
@@ -283,7 +290,7 @@ class MultipathTreePackingRouting:
                     # plt.tight_layout()
                     # plt.show()
                 else:
-                    break
+                    G_prime = self.link_manager.get_subgraph(current_time=time_slot)
 
             if num_ghz_in_slot > 0:
                 hasGHZ = True

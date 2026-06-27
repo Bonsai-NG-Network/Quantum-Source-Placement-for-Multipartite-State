@@ -12,10 +12,10 @@ scalable workflow:
     4. Repeat until no positive reduced-profit tree is found.
     5. Solve the final integer master problem over generated columns.
 
-The final output is still a source placement. The master problems maximize an
-expected per-slot throughput surrogate based on the same physical
-probabilities as the simulator; entanglement routing, swapping, and fusion are
-sampled afterwards by the stochastic simulator.
+The final output is still a source/link-generation attempt placement. The
+master problems maximize the REPS provisioning-stage surrogate objective;
+entanglement routing, swapping, and fusion are sampled afterwards by the
+stochastic simulator.
 """
 
 from __future__ import annotations
@@ -37,12 +37,10 @@ from ilp_multipartite_source_placement import (
     GUROBI_SEED_MAX,
     CandidateTree,
     MultipartiteRequest,
+    build_edge_generation_probabilities,
     build_candidate_trees_for_requests,
-    compute_tree_memory,
-    ilp_objective_mode,
     norm_edge,
     requests_from_user_sets,
-    served_request_priority,
     solve_joint_source_placement_ilp,
     status_to_string,
     tree_expected_throughput_value,
@@ -61,14 +59,7 @@ class RMPResult:
     status: int
     status_name: str
     objective: float
-    request_duals: Dict[int, float]
-    request_lower_duals: Dict[int, float]
-    request_upper_duals: Dict[int, float]
     edge_duals: Dict[Edge, float]
-    edge_exact_duals: Dict[Edge, float]
-    budget_dual: float
-    memory_duals: Dict[Any, float]
-    source_memory_duals: Dict[Any, float]
     objective_mode: str
     model: Any
 
@@ -121,8 +112,6 @@ def candidate_from_tree(
         q_rem=q_rem,
         weight_attr=weight_attr,
     )
-    memory = compute_tree_memory(rebuilt, request.terminals, memory_model="degree")
-
     return CandidateTree(
         tree_id=tree_id,
         request_id=request.request_id,
@@ -131,7 +120,7 @@ def candidate_from_tree(
         edges=sorted(norm_edge(u, v) for u, v in rebuilt.edges()),
         swap_nodes=list(plan.swap_nodes),
         fusion_nodes=list(plan.fusion_nodes),
-        memory=memory,
+        memory={},
         rho=plan.rho,
         reduced_edges=sorted(norm_edge(u, v) for u, v in plan.reduced_tree.edges()),
         removal_nodes=list(plan.candidate_removal_nodes),
@@ -171,14 +160,15 @@ def solve_restricted_master_lp(
     node_memory: Optional[Dict[Any, int]] = None,
     source_cost: int = 1,
     max_trees_per_request: int = 1,
+    p_op: float = 0.8,
     solver_seed: Optional[int] = None,
     verbose: bool = False,
 ) -> RMPResult:
+    del max_trees_per_request
     edges = sorted(norm_edge(u, v) for u, v in graph.edges())
     nodes = sorted(graph.nodes())
     if node_memory is None:
         node_memory = {v: 10**6 for v in nodes}
-    max_trees_per_request = max(1, int(max_trees_per_request))
 
     model = gp.Model("cg_restricted_master_lp")
     if not verbose:
@@ -187,7 +177,6 @@ def solve_restricted_master_lp(
         model.Params.Seed = int(solver_seed) % GUROBI_SEED_MAX
 
     x = {}
-    y = {}
     z = {
         edge: model.addVar(
             lb=0.0,
@@ -197,71 +186,32 @@ def solve_restricted_master_lp(
         )
         for edge in edges
     }
+    edge_generation_prob = build_edge_generation_probabilities(graph, edges, p_op=p_op)
+
     for req in requests:
-        y[req.request_id] = model.addVar(
-            lb=0.0,
-            ub=1.0,
-            vtype=GRB.CONTINUOUS,
-            name=f"y_r{req.request_id}",
-        )
         for tree in candidate_trees.get(req.request_id, []):
             x[(req.request_id, tree.tree_id)] = model.addVar(
                 lb=0.0,
-                ub=1.0,
                 vtype=GRB.CONTINUOUS,
                 name=f"x_r{req.request_id}_t{tree.tree_id}",
             )
     model.update()
 
-    objective_mode = ilp_objective_mode()
-    if objective_mode not in {
-        "expected_throughput",
-        "coverage_expected_throughput",
-        "coverage_expected_throughput_with_redundancy",
-    }:
-        raise ValueError(f"Unsupported ILP objective_mode={objective_mode!r}.")
+    objective_mode = "reps_source_provisioning_rmp"
 
-    coverage_terms = []
-    if objective_mode in {
-        "coverage_expected_throughput",
-        "coverage_expected_throughput_with_redundancy",
-    }:
-        coverage_weight = served_request_priority(candidate_trees)
-        coverage_terms = [
-            coverage_weight * y[req.request_id]
-            for req in requests
-        ]
-
-    # The RMP uses expected tree utility w_r * rho_{r,t}. Actual Bernoulli
-    # link, swap, and fusion outcomes are sampled later by the simulator.
+    # The RMP uses operation-level tree utility. Link-generation probability is
+    # captured by expected edge-capacity constraints.
     expected_terms = [
         tree_expected_throughput_value(req, tree) * x[(req.request_id, tree.tree_id)]
         for req in requests
         for tree in candidate_trees.get(req.request_id, [])
     ]
     model.setObjective(
-        gp.quicksum(coverage_terms + expected_terms),
+        gp.quicksum(expected_terms),
         GRB.MAXIMIZE,
     )
 
-    request_lower_constraints = {}
-    request_upper_constraints = {}
-    for req in requests:
-        selected_for_request = gp.quicksum(
-            x[(req.request_id, tree.tree_id)]
-            for tree in candidate_trees.get(req.request_id, [])
-        )
-        request_lower_constraints[req.request_id] = model.addConstr(
-            y[req.request_id] - selected_for_request <= 0,
-            name=f"request_coverage_lower_r{req.request_id}",
-        )
-        request_upper_constraints[req.request_id] = model.addConstr(
-            selected_for_request - max_trees_per_request * y[req.request_id] <= 0,
-            name=f"request_tree_limit_r{req.request_id}",
-        )
-
     edge_constraints = {}
-    edge_exact_constraints = {}
     for edge in edges:
         selected_edge_load = gp.quicksum(
                 x[(req.request_id, tree.tree_id)]
@@ -270,15 +220,11 @@ def solve_restricted_master_lp(
                 if edge in tree.edges
             )
         edge_constraints[edge] = model.addConstr(
-            selected_edge_load - z[edge] <= 0,
-            name=f"edge_source_capacity_{edge[0]}_{edge[1]}",
-        )
-        edge_exact_constraints[edge] = model.addConstr(
-            z[edge] - selected_edge_load <= 0,
-            name=f"edge_source_exact_without_redundancy_{edge[0]}_{edge[1]}",
+            selected_edge_load <= edge_generation_prob[edge] * z[edge],
+            name=f"expected_edge_capacity_{edge[0]}_{edge[1]}",
         )
 
-    budget_constraint = model.addConstr(
+    model.addConstr(
         gp.quicksum(
             source_cost * z[edge]
             for edge in edges
@@ -287,26 +233,15 @@ def solve_restricted_master_lp(
         name="source_budget",
     )
 
-    memory_constraints = {}
-    source_memory_constraints = {}
     for node in nodes:
-        memory_constraints[node] = model.addConstr(
-            gp.quicksum(
-                tree.memory.get(node, 0) * x[(req.request_id, tree.tree_id)]
-                for req in requests
-                for tree in candidate_trees.get(req.request_id, [])
-            )
-            <= int(node_memory.get(node, 0)),
-            name=f"memory_{node}",
-        )
-        source_memory_constraints[node] = model.addConstr(
+        model.addConstr(
             gp.quicksum(
                 z[edge]
                 for edge in edges
                 if node in edge
             )
-            <= int(node_memory.get(node, 0)),
-            name=f"memory_source_placement_{node}",
+                <= int(node_memory.get(node, 0)),
+            name=f"node_memory_{node}",
         )
 
     model.optimize()
@@ -317,40 +252,23 @@ def solve_restricted_master_lp(
             status=status,
             status_name=status_to_string(status),
             objective=0.0,
-            request_duals={},
-            request_lower_duals={},
-            request_upper_duals={},
             edge_duals={},
-            edge_exact_duals={},
-            budget_dual=0.0,
-            memory_duals={},
-            source_memory_duals={},
             objective_mode=objective_mode,
             model=model,
         )
 
-    request_lower_duals = {
-        req_id: float(constr.Pi) for req_id, constr in request_lower_constraints.items()
+    raw_edge_duals = {edge: float(constr.Pi) for edge, constr in edge_constraints.items()}
+    use_negative_sign = raw_edge_duals and max(raw_edge_duals.values()) <= 0.0
+    edge_duals = {
+        edge: max(0.0, -value if use_negative_sign else value)
+        for edge, value in raw_edge_duals.items()
     }
-    request_upper_duals = {
-        req_id: float(constr.Pi) for req_id, constr in request_upper_constraints.items()
-    }
+
     return RMPResult(
         status=status,
         status_name=status_to_string(status),
         objective=float(model.ObjVal),
-        request_duals=request_upper_duals,
-        request_lower_duals=request_lower_duals,
-        request_upper_duals=request_upper_duals,
-        edge_duals={edge: float(constr.Pi) for edge, constr in edge_constraints.items()},
-        edge_exact_duals={edge: float(constr.Pi) for edge, constr in edge_exact_constraints.items()},
-        budget_dual=float(budget_constraint.Pi),
-        memory_duals={
-            node: float(constr.Pi) for node, constr in memory_constraints.items()
-        },
-        source_memory_duals={
-            node: float(constr.Pi) for node, constr in source_memory_constraints.items()
-        },
+        edge_duals=edge_duals,
         objective_mode=objective_mode,
         model=model,
     )
@@ -359,37 +277,16 @@ def solve_restricted_master_lp(
 def reduced_profit(
     request: MultipartiteRequest,
     tree: CandidateTree,
-    request_lower_dual: float,
-    request_upper_dual: float,
     edge_duals: Dict[Edge, float],
-    edge_exact_duals: Dict[Edge, float],
-    budget_dual: float,
-    memory_duals: Dict[Any, float],
-    source_cost: int = 1,
 ) -> float:
-    del budget_dual, source_cost
-    edge_cost = sum(
-        edge_duals.get(edge, 0.0) - edge_exact_duals.get(edge, 0.0)
-        for edge in tree.edges
-    )
-    memory_cost = sum(
-        memory_duals.get(node, 0.0) * amount for node, amount in tree.memory.items()
-    )
-    # RMP request constraints are written as:
-    #   y_r - sum_t x_{r,t} <= 0
-    #   sum_t x_{r,t} - D_r y_r <= 0
-    # so an x-column has coefficients -1 and +1 in those constraints.
-    request_dual_cost = request_upper_dual - request_lower_dual
+    edge_cost = sum(edge_duals.get(edge, 0.0) for edge in tree.edges)
     expected_value = tree_expected_throughput_value(request, tree)
-    return float(expected_value - request_dual_cost - edge_cost - memory_cost)
+    return float(expected_value - edge_cost)
 
 
 def build_pricing_graph(
     graph: nx.Graph,
     edge_duals: Dict[Edge, float],
-    budget_dual: float,
-    memory_duals: Dict[Any, float],
-    source_cost: int = 1,
     jitter: float = 0.0,
     rng_seed: Optional[int] = None,
 ) -> nx.Graph:
@@ -400,12 +297,7 @@ def build_pricing_graph(
     priced.add_nodes_from(graph.nodes(data=True))
     for u, v, data in graph.edges(data=True):
         edge = norm_edge(u, v)
-        weight = (
-            budget_dual * source_cost
-            + edge_duals.get(edge, 0.0)
-            + memory_duals.get(u, 0.0)
-            + memory_duals.get(v, 0.0)
-        )
+        weight = edge_duals.get(edge, 0.0)
         if jitter > 0:
             weight *= 1.0 + jitter * rng.random()
         weight = max(float(weight), 1e-9)
@@ -422,7 +314,6 @@ def price_request_columns(
     rmp_result: RMPResult,
     existing_signatures: set,
     start_tree_id: int,
-    source_cost: int = 1,
     p_op: float = 0.8,
     q_swap: float = 1.0,
     q_fus: float = 1.0,
@@ -433,8 +324,6 @@ def price_request_columns(
     seed: Optional[int] = None,
 ) -> List[PricingResult]:
     results: List[PricingResult] = []
-    request_lower_dual = rmp_result.request_lower_duals.get(request.request_id, 0.0)
-    request_upper_dual = rmp_result.request_upper_duals.get(request.request_id, 0.0)
     next_id = start_tree_id
     added_count = 0
     max_columns_to_add = max(1, int(max_columns_to_add))
@@ -443,9 +332,6 @@ def price_request_columns(
         pricing_graph = build_pricing_graph(
             graph=graph,
             edge_duals=rmp_result.edge_duals,
-            budget_dual=rmp_result.budget_dual,
-            memory_duals=rmp_result.memory_duals,
-            source_cost=source_cost,
             jitter=0.02 if trial > 0 else 0.0,
             rng_seed=derive_seed(seed, "pricing-graph", request.request_id, trial),
         )
@@ -476,13 +362,7 @@ def price_request_columns(
         profit = reduced_profit(
             request,
             candidate,
-            request_lower_dual=request_lower_dual,
-            request_upper_dual=request_upper_dual,
             edge_duals=rmp_result.edge_duals,
-            edge_exact_duals=rmp_result.edge_exact_duals,
-            budget_dual=rmp_result.budget_dual,
-            memory_duals=rmp_result.memory_duals,
-            source_cost=source_cost,
         )
         added = profit > reduced_profit_tol
         results.append(
@@ -510,7 +390,6 @@ def price_request_columns_from_pool(
     existing_signatures: set,
     max_columns_to_add: int = 1,
     reduced_profit_tol: float = 1e-6,
-    source_cost: int = 1,
 ) -> List[PricingResult]:
     """
     Exact reduced-profit pricing over a finite candidate pool.
@@ -519,8 +398,6 @@ def price_request_columns_from_pool(
     It is exact over the same finite candidate-tree universe generated for the
     ILP family, which makes ILP-CG easier to audit and compare.
     """
-    request_lower_dual = rmp_result.request_lower_duals.get(request.request_id, 0.0)
-    request_upper_dual = rmp_result.request_upper_duals.get(request.request_id, 0.0)
     scored: List[Tuple[float, CandidateTree]] = []
     for candidate in pool_trees:
         signature = frozenset(candidate.edges)
@@ -529,13 +406,7 @@ def price_request_columns_from_pool(
         profit = reduced_profit(
             request,
             candidate,
-            request_lower_dual=request_lower_dual,
-            request_upper_dual=request_upper_dual,
             edge_duals=rmp_result.edge_duals,
-            edge_exact_duals=rmp_result.edge_exact_duals,
-            budget_dual=rmp_result.budget_dual,
-            memory_duals=rmp_result.memory_duals,
-            source_cost=source_cost,
         )
         scored.append((profit, candidate))
 
@@ -670,6 +541,7 @@ def column_generation_source_placement(
     rmp_history = []
     pricing_history = []
     total_added = 0
+    last_max_reduced_cost = None
 
     for iteration in range(max_iterations):
         rmp_result = solve_restricted_master_lp(
@@ -681,6 +553,7 @@ def column_generation_source_placement(
             node_memory=node_memory,
             source_cost=source_cost,
             max_trees_per_request=max_trees_per_request,
+            p_op=p_op,
             solver_seed=derive_seed(solver_seed, "iteration", iteration),
             verbose=verbose,
         )
@@ -697,6 +570,7 @@ def column_generation_source_placement(
             break
 
         added_this_iteration = 0
+        iteration_reduced_costs: List[float] = []
         next_id = next_tree_id(candidate_trees)
         for req in requests:
             if pricing_mode == "candidate_pool_exact":
@@ -707,7 +581,6 @@ def column_generation_source_placement(
                     existing_signatures=signatures.setdefault(req.request_id, set()),
                     max_columns_to_add=max_pricing_columns_per_request,
                     reduced_profit_tol=reduced_profit_tol,
-                    source_cost=source_cost,
                 )
             else:
                 pricing_results = price_request_columns(
@@ -716,7 +589,6 @@ def column_generation_source_placement(
                     rmp_result=rmp_result,
                     existing_signatures=signatures.setdefault(req.request_id, set()),
                     start_tree_id=next_id,
-                    source_cost=source_cost,
                     p_op=p_op,
                     q_swap=q_swap,
                     q_fus=q_fus,
@@ -731,11 +603,13 @@ def column_generation_source_placement(
                     "iteration": iteration,
                     "request_id": item.request_id,
                     "reduced_profit": item.reduced_profit,
+                    "reduced_cost": item.reduced_profit,
                     "added": item.added,
                     "pricing_mode": pricing_mode,
                 }
                 for item in pricing_results
             )
+            iteration_reduced_costs.extend(item.reduced_profit for item in pricing_results)
 
             for item in pricing_results:
                 if item.added and item.candidate is not None:
@@ -750,6 +624,10 @@ def column_generation_source_placement(
                 f"added={added_this_iteration}"
             )
 
+        last_max_reduced_cost = max(iteration_reduced_costs, default=0.0)
+        rmp_history[-1]["max_reduced_cost"] = last_max_reduced_cost
+        rmp_history[-1]["added_columns"] = added_this_iteration
+
         if added_this_iteration == 0:
             break
 
@@ -761,8 +639,7 @@ def column_generation_source_placement(
         max_sources_per_edge=max_sources_per_edge,
         node_memory=node_memory,
         source_cost=source_cost,
-        allow_multiple_trees_per_request=True,
-        demand_per_request=max_trees_per_request,
+        p_op=p_op,
         time_limit=final_time_limit,
         mip_gap=final_mip_gap,
         solver_seed=None if final_solver_seed is None else int(final_solver_seed) % GUROBI_SEED_MAX,
@@ -772,6 +649,7 @@ def column_generation_source_placement(
     final_result["cg_candidate_trees"] = candidate_trees
     final_result["cg_iterations"] = len(rmp_history)
     final_result["cg_added_columns"] = total_added
+    final_result["cg_last_max_reduced_cost"] = last_max_reduced_cost
     final_result["cg_rmp_history"] = rmp_history
     final_result["cg_pricing_history"] = pricing_history
     final_result["cg_pricing_mode"] = pricing_mode
@@ -781,6 +659,10 @@ def column_generation_source_placement(
     final_result["cg_final_solver_seed"] = final_solver_seed
     final_result["cg_max_trees_per_request"] = max_trees_per_request
     final_result["cg_max_pricing_columns_per_request"] = max_pricing_columns_per_request
+    final_result["ilp_cg_optimality_note"] = (
+        "ILP-CG solves LP-relaxed RMPs and a final integer RMP over generated columns. "
+        "Without branch-and-price it is not guaranteed to equal the Full ILP integer optimum."
+    )
     final_result["candidate_tree_counts"] = {
         req_id: len(trees) for req_id, trees in candidate_trees.items()
     }
@@ -848,8 +730,7 @@ def solve_single_slot_ilp_cg_request_batch(
             max_sources_per_edge=max_sources_per_edge,
             node_memory=node_memory,
             source_cost=1,
-            allow_multiple_trees_per_request=True,
-            demand_per_request=nested_max_trees,
+            p_op=p_op,
             time_limit=final_time_limit,
             mip_gap=final_mip_gap,
             solver_seed=None if solver_seed is None else int(solver_seed) % GUROBI_SEED_MAX,
@@ -858,6 +739,7 @@ def solve_single_slot_ilp_cg_request_batch(
         result["cg_candidate_trees"] = candidate_trees
         result["cg_iterations"] = 0
         result["cg_added_columns"] = 0
+        result["cg_last_max_reduced_cost"] = None
         result["cg_rmp_history"] = []
         result["cg_pricing_history"] = []
         result["cg_initial_seed"] = candidate_seed
@@ -865,16 +747,21 @@ def solve_single_slot_ilp_cg_request_batch(
         result["cg_max_trees_per_request"] = nested_max_trees
         result["cg_max_pricing_columns_per_request"] = 0
         result["cg_nested_pool"] = True
+        result["ilp_cg_optimality_note"] = (
+            "Nested-pool ILP-CG solves the REPS ILP on a restricted candidate-tree pool; "
+            "it is not guaranteed to equal the Full ILP over a larger candidate set."
+        )
         result["candidate_tree_counts"] = {
             req_id: len(trees) for req_id, trees in candidate_trees.items()
         }
-        result["throughput_selected_trees"] = len(result["selected_trees"])
-        result["throughput_covered_requests"] = len(result.get("covered_requests", result["served_requests"]))
-        result["throughput_qbps"] = result["throughput_covered_requests"]
+        result["throughput_selected_trees"] = result.get("throughput_provisioned_units", len(result["selected_trees"]))
+        result["throughput_covered_requests"] = len(result["served_requests"])
+        result["throughput_qbps"] = None
+        result["realized_throughput"] = None
+        result["provisioning_surrogate_objective"] = result.get("ilp_expected_objective", result["objective"] or 0.0)
         result["ilp_expected_objective"] = result.get("ilp_expected_objective", result["objective"] or 0.0)
-        result["ilp_expected_throughput_term"] = result.get("ilp_expected_throughput_term", 0.0)
-        result["ilp_covered_requests"] = result.get("ilp_covered_requests", result["throughput_covered_requests"])
-        result["ilp_selected_tree_count"] = result.get("ilp_selected_tree_count", result["throughput_selected_trees"])
+        result["ilp_operation_objective_term"] = result.get("ilp_operation_objective_term", 0.0)
+        result["ilp_provisioned_units"] = result.get("ilp_provisioned_units", result["throughput_selected_trees"])
         result["deployed_source_count"] = result.get(
             "deployed_source_count",
             sum(result.get("routing_source_placement", {}).values()),
@@ -905,13 +792,14 @@ def solve_single_slot_ilp_cg_request_batch(
         verbose=verbose,
     )
 
-    result["throughput_selected_trees"] = len(result["selected_trees"])
-    result["throughput_covered_requests"] = len(result.get("covered_requests", result["served_requests"]))
-    result["throughput_qbps"] = result["throughput_covered_requests"]
+    result["throughput_selected_trees"] = result.get("throughput_provisioned_units", len(result["selected_trees"]))
+    result["throughput_covered_requests"] = len(result["served_requests"])
+    result["throughput_qbps"] = None
+    result["realized_throughput"] = None
+    result["provisioning_surrogate_objective"] = result.get("ilp_expected_objective", result["objective"] or 0.0)
     result["ilp_expected_objective"] = result.get("ilp_expected_objective", result["objective"] or 0.0)
-    result["ilp_expected_throughput_term"] = result.get("ilp_expected_throughput_term", 0.0)
-    result["ilp_covered_requests"] = result.get("ilp_covered_requests", result["throughput_covered_requests"])
-    result["ilp_selected_tree_count"] = result.get("ilp_selected_tree_count", result["throughput_selected_trees"])
+    result["ilp_operation_objective_term"] = result.get("ilp_operation_objective_term", 0.0)
+    result["ilp_provisioned_units"] = result.get("ilp_provisioned_units", result["throughput_selected_trees"])
     result["deployed_source_count"] = result.get(
         "deployed_source_count",
         sum(result.get("routing_source_placement", {}).values()),
