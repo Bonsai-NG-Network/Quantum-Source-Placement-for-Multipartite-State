@@ -152,6 +152,91 @@ def flatten_request_users(request_batch: Sequence[Sequence[Any]]) -> List[Any]:
     return ordered_unique([user for request in request_batch for user in request])
 
 
+def enforce_node_memory_on_source_list(
+    sources: Sequence[Tuple[Any, Any]],
+    node_memory_capacity: Optional[int],
+    candidate_edges: Optional[Sequence[Tuple[Any, Any]]] = None,
+    cost_budget: Optional[int] = None,
+    max_per_edge: Optional[int] = None,
+) -> Tuple[List[Tuple[Any, Any]], Dict[str, Any]]:
+    """
+    Filter source/link-generation attempts so baseline placement methods obey
+    the same incident source-attempt node memory constraint as the ILP family:
+
+        sum_{e in delta(v)} z_e <= M_v.
+    """
+    if node_memory_capacity is None:
+        return list(sources), {
+            "node_memory_enforced": False,
+            "node_memory_capacity": None,
+            "node_memory_filtered_attempts": 0,
+            "node_memory_load": {},
+            "max_node_memory_load": 0,
+            "node_memory_violations": {},
+        }
+
+    cap = int(node_memory_capacity)
+    if cap < 0:
+        raise ValueError("node_memory_capacity must be non-negative or None.")
+
+    filtered: List[Tuple[Any, Any]] = []
+    load: Dict[Any, int] = {}
+    per_edge_count: Dict[Tuple[Any, Any], int] = {}
+    dropped = 0
+    for raw_edge in sources:
+        edge = tuple(sorted(raw_edge[:2]))
+        u, v = edge
+        if load.get(u, 0) >= cap or load.get(v, 0) >= cap:
+            dropped += 1
+            continue
+        if max_per_edge is not None and per_edge_count.get(edge, 0) >= int(max_per_edge):
+            dropped += 1
+            continue
+        filtered.append(edge)
+        per_edge_count[edge] = per_edge_count.get(edge, 0) + 1
+        load[u] = load.get(u, 0) + 1
+        load[v] = load.get(v, 0) + 1
+
+    filled = 0
+    if candidate_edges is not None and cost_budget is not None and max_per_edge is not None:
+        target_budget = int(cost_budget)
+        edge_cap = int(max_per_edge)
+        ranked_edges = [tuple(sorted(edge[:2])) for edge in candidate_edges]
+        while len(filtered) < target_budget:
+            placed_in_round = False
+            for edge in ranked_edges:
+                if len(filtered) >= target_budget:
+                    break
+                if per_edge_count.get(edge, 0) >= edge_cap:
+                    continue
+                u, v = edge
+                if load.get(u, 0) >= cap or load.get(v, 0) >= cap:
+                    continue
+                filtered.append(edge)
+                per_edge_count[edge] = per_edge_count.get(edge, 0) + 1
+                load[u] = load.get(u, 0) + 1
+                load[v] = load.get(v, 0) + 1
+                filled += 1
+                placed_in_round = True
+            if not placed_in_round:
+                break
+
+    violations = {
+        node: value
+        for node, value in load.items()
+        if value > cap
+    }
+    return filtered, {
+        "node_memory_enforced": True,
+        "node_memory_capacity": cap,
+        "node_memory_filtered_attempts": dropped,
+        "node_memory_backfilled_attempts": filled,
+        "node_memory_load": dict(sorted(load.items(), key=lambda item: str(item[0]))),
+        "max_node_memory_load": max(load.values(), default=0),
+        "node_memory_violations": violations,
+    }
+
+
 def generate_request_batches(
     all_nodes: List[Any],
     num_trials: int,
@@ -376,9 +461,26 @@ def place_sources_for_batch(
         )
 
         sources = []
-        for edge, count in alloc.items():
-            for _ in range(count):
-                sources.append(edge)
+        ranked_alloc_edges = sorted(
+            alloc,
+            key=lambda edge: (-float(scores.get(edge, 0.0)), edge[0], edge[1]),
+        )
+        max_alloc = max((int(count) for count in alloc.values()), default=0)
+        for round_idx in range(max_alloc):
+            for edge in ranked_alloc_edges:
+                if int(alloc.get(edge, 0)) > round_idx:
+                    sources.append(edge)
+        raw_sources = list(sources)
+        sources, memory_metadata = enforce_node_memory_on_source_list(
+            sources,
+            node_memory_capacity,
+            candidate_edges=sorted(
+                cand_edges,
+                key=lambda edge: (-float(scores.get(edge, 0.0)), edge[0], edge[1]),
+            ),
+            cost_budget=cost_budget,
+            max_per_edge=simulator.max_per_edge,
+        )
         placer.sources = sources
 
         metadata = {
@@ -390,11 +492,14 @@ def place_sources_for_batch(
                 req_id: len(trees) for req_id, trees in candidate_trees.items()
             },
             "dp_path_edge_count": len(path_edges),
-            "dp_allocation": alloc,
+            "dp_raw_allocation": alloc,
+            "dp_allocation": dict(Counter(tuple(sorted(edge[:2])) for edge in sources)),
             "dp_value": dp_value,
             "dp_parts": parts,
             "dp_total_pairs": total_pairs,
+            "dp_raw_source_count": len(raw_sources),
         }
+        metadata.update(memory_metadata)
         return sources, placer.compute_cost(), metadata
 
     if source_method == "OP_BP":
@@ -417,13 +522,27 @@ def place_sources_for_batch(
             cost_budget=cost_budget,
             max_per_edge=simulator.max_per_edge,
         )
+        raw_sources = list(sources)
+        sources, memory_metadata = enforce_node_memory_on_source_list(
+            sources,
+            node_memory_capacity,
+            candidate_edges=sorted(
+                placer.edge_scores,
+                key=lambda edge: (-placer.edge_scores[edge], edge[0], edge[1]),
+            ),
+            cost_budget=cost_budget,
+            max_per_edge=simulator.max_per_edge,
+        )
+        placer.sources = sources
         metadata = {
             "betweenness_scores": placer.edge_scores,
             "allocation": placer.allocation(),
             "used_budget": placer.compute_cost(),
             "candidate_edge_count": len(placer.edge_scores),
             "effective_capacity": len(placer.edge_scores) * simulator.max_per_edge,
+            "raw_source_count": len(raw_sources),
         }
+        metadata.update(memory_metadata)
         return sources, placer.compute_cost(), metadata
 
     if source_method == "ILP":
@@ -1415,8 +1534,17 @@ def plot_budget_sweep_comparison(
 
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     algorithm_order = ordered_algorithm_labels(algorithms)
+
+    def sweep_lookup_key(value: Any) -> str:
+        if pd.isna(value):
+            return ""
+        try:
+            return f"{float(value):.12g}"
+        except (TypeError, ValueError):
+            return str(value)
+
     summary_by_pair = {
-        (str(row[x_column]), str(row["algorithm"])): row
+        (sweep_lookup_key(row[x_column]), str(row["algorithm"])): row
         for _, row in summary.iterrows()
     }
 
@@ -1432,7 +1560,7 @@ def plot_budget_sweep_comparison(
         means = []
         ci95_halfwidths = []
         for x_value in budgets:
-            row = summary_by_pair.get((str(x_value), algorithm_label))
+            row = summary_by_pair.get((sweep_lookup_key(x_value), algorithm_label))
             if row is None:
                 means.append(0.0)
                 ci95_halfwidths.append(0.0)
